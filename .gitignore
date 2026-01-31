@@ -1,0 +1,29 @@
+# Build artifacts
+/target/
+
+# Cargo lock file (optional - can be included for applications, excluded for libraries)
+# Cargo.lock
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Claude Code session files
+.claude/
+
+# Solution output files (generated at runtime)
+BS_*.txt
+
+# Log files
+*.log
+
+# Planning docs
+V6_IMPROVEMENTS.md
+SCALING_TO_BS_31_30.md
