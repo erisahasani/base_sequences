@@ -27,3 +27,10 @@ BS_*.txt
 # Planning docs
 V6_IMPROVEMENTS.md
 SCALING_TO_BS_31_30.md
+
+*.json
+*.md
+*.sh
+*.py
+arXiv*
+test_delta_correctness.rs
