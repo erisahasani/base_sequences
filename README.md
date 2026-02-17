@@ -1,47 +1,41 @@
 # Base Sequences
 
-Search for Base Sequences BS(n+1, n) using exhaustive search with optimized stochastic local search.
-
-Based on: Wang & Zhu (2025) "On Base, Normal and Near-normal Sequences" [arXiv:2506.20296](https://arxiv.org/abs/2506.20296)
+Search for Base Sequences BS(n+1, n) implementing the 5-step algorithm from Wang & Zhu (2025) "On Base, Normal and Near-normal Sequences" [arXiv:2506.20296](https://arxiv.org/abs/2506.20296).
 
 ## Quick Start
 
 ```bash
 # Build
-cargo build --release --bin find_bs_generic_v7
+cargo build --release --bin find_bs_generic_v6
 
-# Run (always exhaustive, guaranteed results)
-./target/release/find_bs_generic_v7 30
+# Run
+./target/release/find_bs_generic_v6 25
 ```
 
-**V7 is the recommended tool** - 21.6× faster than V6 with guaranteed completeness.
+## Algorithm
 
-## What are Base Sequences?
+The search follows the paper's 5-step pipeline:
 
-Four ±1 sequences A, B, C, D where the sum of autocorrelations equals zero at all non-zero shifts. Used to construct Hadamard matrices and orthogonal designs.
+1. **Tuple discovery** — find (a,b,c,d) and (a\*,b\*,c\*,d\*) satisfying sum-of-squares constraints (Theorem 2.1), paired via mod-4 signature matching (Equation 2.4), reduced by 5-class isomorphic filtering
+2. **Mod-3 partial sums** — enumerate position-class constraints modulo 3 (Theorem 2.3, m=3)
+3. **Mod-6 CD refinement** — refine to modulo 6 (Theorem 2.3, m=6)
+4. **CD generation + spectral filter** — backtrack to build C,D sequences, filtered by power spectral density bound (Theorem 2.4)
+5. **AB search** — backtrack to find A,B sequences satisfying the PAF constraint (Theorem 2.2)
 
-## Performance
+## Performance (V6)
 
-| n | V7 Time | Guarantee |
-|---|---------|-----------|
-| 15 | 5 seconds | ✅ 100% |
-| 20 | 2 minutes | ✅ 100% |
-| 25 | 30 minutes | ✅ 100% |
-| 30 | 1-2 days | ✅ 100% |
-| 35 | ~1 week | ✅ 100% |
-
-## Documentation
-
-- **[V7_FINAL_SUMMARY.md](V7_FINAL_SUMMARY.md)** - Complete guide (start here)
-- **[QUICK_START.md](QUICK_START.md)** - Quick reference
-- **[V7_PROFILE_AND_CORRECTNESS_REPORT.md](V7_PROFILE_AND_CORRECTNESS_REPORT.md)** - Technical verification
-- **[DOCUMENTATION_STATUS.md](DOCUMENTATION_STATUS.md)** - Documentation index
+| n | Time | CDs tried |
+|---|------|-----------|
+| 10 | instant | 7 |
+| 15 | instant | 35 |
+| 20 | 37s | 3,750 |
+| 25 | 29s | 134 |
 
 ## Versions
 
-- **V7** (Recommended): Always exhaustive, 21.6× faster than V6, guaranteed results
-- **V6** (Reference): Legacy exhaustive implementation, kept for comparison
+- **V6** — pure paper pipeline, self-contained (~4400 lines), parallel via rayon
+- **V7** — experimental variant
 
-## License
+## Reference
 
-MIT
+Wang & Zhu (2025) "On Base, Normal and Near-normal Sequences" [arXiv:2506.20296](https://arxiv.org/abs/2506.20296)
