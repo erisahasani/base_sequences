@@ -21,3 +21,7 @@ path = "rust_code/find_bs_generic_v6.rs"
 [[bin]]
 name = "find_bs_generic_v7"
 path = "rust_code/find_bs_generic_v7.rs"
+
+[[bin]]
+name = "find_bs_v6_evolve1"
+path = "rust_code/find_bs_v6_evolve1.rs"

@@ -33,7 +33,7 @@ The search follows the paper's 5-step pipeline:
 
 ## Versions
 
-- **V6** — pure paper pipeline, self-contained (~4400 lines), parallel via rayon
+- **V6** — pure paper pipeline, self-contained (~2700 lines), parallel via rayon
 - **V7** — experimental variant
 
 ## Reference

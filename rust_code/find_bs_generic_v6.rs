@@ -1122,6 +1122,8 @@ fn check_mod6_ab_feasible_sampled(
 /// Integrates spectral filtering: maintains Hall polynomial incrementally,
 /// checks exact spectral bound at base case, prunes via lower bound near leaves.
 /// Returns (spectrally-valid CDs, total CDs that reached spectral check).
+
+
 fn backtrack_cd_from_mod6(
     n: usize,
     mod6_sol: &Mod6CDSolution,
@@ -1197,17 +1199,19 @@ fn backtrack_cd_from_mod6(
     let num_pairs = pair_positions.len();
 
     // Precompute trig tables for incremental spectral check
-    let num_angles: usize = 200;
+    // Use 128 angles - good balance of pruning vs overhead
+    let num_angles: usize = 128;
     let spectral_threshold = 4.0 * (n as f64) + 2.0 + spectral_margin;
-    let cos_table: Vec<Vec<f64>> = (0..n).map(|pos| {
-        (0..num_angles).map(|k| {
+    // Flat layout: trig_cos[pos * num_angles + k], trig_sin[pos * num_angles + k]
+    let trig_cos: Vec<f64> = (0..n).flat_map(|pos| {
+        (0..num_angles).map(move |k| {
             ((pos as f64) * ((k + 1) as f64) * PI / 100.0).cos()
-        }).collect()
+        })
     }).collect();
-    let sin_table: Vec<Vec<f64>> = (0..n).map(|pos| {
-        (0..num_angles).map(|k| {
+    let trig_sin: Vec<f64> = (0..n).flat_map(|pos| {
+        (0..num_angles).map(move |k| {
             ((pos as f64) * ((k + 1) as f64) * PI / 100.0).sin()
-        }).collect()
+        })
     }).collect();
 
     // Running Hall polynomial state: Re/Im of C and D at each spectral angle
@@ -1237,8 +1241,9 @@ fn backtrack_cd_from_mod6(
         mid_class: usize,
         results: &mut Vec<(Sequence, Sequence)>,
         max_solutions: usize,
-        cos_table: &[Vec<f64>],
-        sin_table: &[Vec<f64>],
+        trig_cos: &[f64],
+        trig_sin: &[f64],
+        num_angles: usize,
         real_c: &mut [f64],
         imag_c: &mut [f64],
         real_d: &mut [f64],
@@ -1247,7 +1252,7 @@ fn backtrack_cd_from_mod6(
         cd_checked: &mut u64,
     ) {
         if results.len() >= max_solutions { return; }
-        let na = real_c.len(); // number of spectral angles
+        let na = num_angles;
 
         if pair_idx >= num_pairs {
             // All pairs filled; handle middle if needed
@@ -1266,11 +1271,14 @@ fn backtrack_cd_from_mod6(
                             // Update spectral for middle position
                             let cm_f = cm as f64;
                             let dm_f = dm as f64;
+                            let mid_off = mid_pos * na;
                             for k in 0..na {
-                                real_c[k] += cm_f * cos_table[mid_pos][k];
-                                imag_c[k] += cm_f * sin_table[mid_pos][k];
-                                real_d[k] += dm_f * cos_table[mid_pos][k];
-                                imag_d[k] += dm_f * sin_table[mid_pos][k];
+                                let c = trig_cos[mid_off + k];
+                                let s = trig_sin[mid_off + k];
+                                real_c[k] += cm_f * c;
+                                imag_c[k] += cm_f * s;
+                                real_d[k] += dm_f * c;
+                                imag_d[k] += dm_f * s;
                             }
 
                             // Exact spectral check
@@ -1293,10 +1301,12 @@ fn backtrack_cd_from_mod6(
 
                             // Undo spectral for middle
                             for k in 0..na {
-                                real_c[k] -= cm_f * cos_table[mid_pos][k];
-                                imag_c[k] -= cm_f * sin_table[mid_pos][k];
-                                real_d[k] -= dm_f * cos_table[mid_pos][k];
-                                imag_d[k] -= dm_f * sin_table[mid_pos][k];
+                                let c = trig_cos[mid_off + k];
+                                let s = trig_sin[mid_off + k];
+                                real_c[k] -= cm_f * c;
+                                imag_c[k] -= cm_f * s;
+                                real_d[k] -= dm_f * c;
+                                imag_d[k] -= dm_f * s;
                             }
 
                             if results.len() >= max_solutions { return; }
@@ -1371,25 +1381,43 @@ fn backtrack_cd_from_mod6(
                 let di_f = di as f64;
                 let cj_f = cj as f64;
                 let dj_f = dj as f64;
+                let left_off = left * na;
+                let right_off = right * na;
                 for k in 0..na {
-                    real_c[k] += ci_f * cos_table[left][k] + cj_f * cos_table[right][k];
-                    imag_c[k] += ci_f * sin_table[left][k] + cj_f * sin_table[right][k];
-                    real_d[k] += di_f * cos_table[left][k] + dj_f * cos_table[right][k];
-                    imag_d[k] += di_f * sin_table[left][k] + dj_f * sin_table[right][k];
+                    let cl = trig_cos[left_off + k];
+                    let sl = trig_sin[left_off + k];
+                    let cr = trig_cos[right_off + k];
+                    let sr = trig_sin[right_off + k];
+                    real_c[k] += ci_f * cl + cj_f * cr;
+                    imag_c[k] += ci_f * sl + cj_f * sr;
+                    real_d[k] += di_f * cl + dj_f * cr;
+                    imag_d[k] += di_f * sl + dj_f * sr;
                 }
 
-                // Spectral lower bound pruning (effective near leaves)
+                // Spectral lower bound pruning - apply at all levels
                 let unfilled = 2 * (num_pairs - pair_idx - 1)
                     + if has_middle { 1 } else { 0 };
                 let mut spectral_feasible = true;
-                if unfilled <= 6 && unfilled > 0 {
+                if unfilled > 0 {
                     let u = unfilled as f64;
-                    for k in 0..na {
-                        let mag_c = (real_c[k] * real_c[k] + imag_c[k] * imag_c[k]).sqrt();
-                        let mag_d = (real_d[k] * real_d[k] + imag_d[k] * imag_d[k]).sqrt();
+                    // Tiered: more angles closer to leaves for tighter pruning
+                    let check_angles = if unfilled <= 4 { na }
+                        else if unfilled <= 8 { na * 3 / 4 }
+                        else if unfilled <= 16 { na / 2 }
+                        else { na / 4 };
+                    let st = spectral_threshold;
+                    let cutoff_mag = u + st.sqrt();
+                    let cutoff_sq = cutoff_mag * cutoff_mag;
+                    for k in 0..check_angles {
+                        let rc2 = real_c[k] * real_c[k] + imag_c[k] * imag_c[k];
+                        let rd2 = real_d[k] * real_d[k] + imag_d[k] * imag_d[k];
+                        // Quick skip: neither can individually exceed threshold
+                        if rc2 <= cutoff_sq && rd2 <= cutoff_sq { continue; }
+                        let mag_c = rc2.sqrt();
+                        let mag_d = rd2.sqrt();
                         let lb_c = if mag_c > u { mag_c - u } else { 0.0 };
                         let lb_d = if mag_d > u { mag_d - u } else { 0.0 };
-                        if lb_c * lb_c + lb_d * lb_d > spectral_threshold {
+                        if lb_c * lb_c + lb_d * lb_d > st {
                             spectral_feasible = false;
                             break;
                         }
@@ -1404,7 +1432,7 @@ fn backtrack_cd_from_mod6(
                         c_total, target_p, target_q,
                         has_middle, mid_pos, mid_class,
                         results, max_solutions,
-                        cos_table, sin_table,
+                        trig_cos, trig_sin, num_angles,
                         real_c, imag_c, real_d, imag_d,
                         spectral_threshold, cd_checked,
                     );
@@ -1412,10 +1440,14 @@ fn backtrack_cd_from_mod6(
 
                 // Undo spectral state
                 for k in 0..na {
-                    real_c[k] -= ci_f * cos_table[left][k] + cj_f * cos_table[right][k];
-                    imag_c[k] -= ci_f * sin_table[left][k] + cj_f * sin_table[right][k];
-                    real_d[k] -= di_f * cos_table[left][k] + dj_f * cos_table[right][k];
-                    imag_d[k] -= di_f * sin_table[left][k] + dj_f * sin_table[right][k];
+                    let cl = trig_cos[left_off + k];
+                    let sl = trig_sin[left_off + k];
+                    let cr = trig_cos[right_off + k];
+                    let sr = trig_sin[right_off + k];
+                    real_c[k] -= ci_f * cl + cj_f * cr;
+                    imag_c[k] -= ci_f * sl + cj_f * sr;
+                    real_d[k] -= di_f * cl + dj_f * cr;
+                    imag_d[k] -= di_f * sl + dj_f * sr;
                 }
 
                 if results.len() >= max_solutions {
@@ -1446,7 +1478,7 @@ fn backtrack_cd_from_mod6(
         &c_total, &target_p, &target_q,
         has_middle, mid_pos, mid_class,
         &mut results, max_solutions,
-        &cos_table, &sin_table,
+        &trig_cos, &trig_sin, num_angles,
         &mut real_c, &mut imag_c, &mut real_d, &mut imag_d,
         spectral_threshold, &mut cd_checked,
     );
@@ -1454,10 +1486,12 @@ fn backtrack_cd_from_mod6(
     (results, cd_checked)
 }
 
-
 /// Backtracking search for A,B sequences using Theorem 2.2 constraints.
 /// Uses incremental autocorrelation tracking: O(n) per node instead of O(n²).
 /// Positions filled outside-in; after pair k, shift n-k becomes fully determined.
+
+
+// backtrack_search_ab has been improved
 fn backtrack_search_ab(
     n: usize,
     c: &Sequence,
@@ -1465,7 +1499,7 @@ fn backtrack_search_ab(
     st: &SumTuple,
     at: &AltSumTuple,
     max_nodes: u64,
-) -> Option<(Sequence, Sequence)> {
+) -> (Option<(Sequence, Sequence)>, u64) {
     let m = n + 1; // length of A, B
 
     // Precompute CD autocorrelations (shifts 1..=n for BS(n+1,n))
@@ -1487,6 +1521,8 @@ fn backtrack_search_ab(
     let mut partial_ac = cd_autocorr.clone();
     let mut a_sum = 0i32;
     let mut b_sum = 0i32;
+    let mut a_alt_sum = 0i32; // running alternating sum of a
+    let mut b_alt_sum = 0i32; // running alternating sum of b
 
     // Add contributions of newly-filled position `pos` to all shifts.
     fn update_partial_ac(
@@ -1518,6 +1554,9 @@ fn backtrack_search_ab(
         }
     }
 
+    // Precompute alternating signs for each position
+    let alt_sign: Vec<i32> = (0..m).map(|i| if i % 2 == 0 { 1 } else { -1 }).collect();
+
     fn backtrack(
         pair_idx: usize,
         a: &mut Vec<i32>,
@@ -1528,6 +1567,9 @@ fn backtrack_search_ab(
         partial_ac: &mut Vec<i32>,
         a_sum: &mut i32,
         b_sum: &mut i32,
+        a_alt_sum: &mut i32,
+        b_alt_sum: &mut i32,
+        alt_sign: &[i32],
         st: &SumTuple,
         at: &AltSumTuple,
         nodes_visited: &mut u64,
@@ -1539,12 +1581,7 @@ fn backtrack_search_ab(
         if pair_idx >= num_pairs {
             // All positions filled — check final constraints
             if *a_sum != st.a || *b_sum != st.b { return false; }
-
-            let a_alt: i32 = a.iter().enumerate()
-                .map(|(i, &v)| if i % 2 == 0 { v } else { -v }).sum();
-            let b_alt: i32 = b.iter().enumerate()
-                .map(|(i, &v)| if i % 2 == 0 { v } else { -v }).sum();
-            if a_alt != at.a_star || b_alt != at.b_star { return false; }
+            if *a_alt_sum != at.a_star || *b_alt_sum != at.b_star { return false; }
 
             // Shifts n..=n-num_pairs+1 were checked during recursion.
             // Check remaining shifts 1..=n-num_pairs.
@@ -1562,14 +1599,18 @@ fn backtrack_search_ab(
             if *nodes_visited >= max_nodes { return false; }
 
             // Assign positions and update partial_ac incrementally
+            let (da_alt, db_alt);
             if pos_left == pos_right {
                 a[pos_left] = a_i;
                 b[pos_left] = b_i;
                 *a_sum += a_i;
                 *b_sum += b_i;
+                da_alt = alt_sign[pos_left] * a_i;
+                db_alt = alt_sign[pos_left] * b_i;
+                *a_alt_sum += da_alt;
+                *b_alt_sum += db_alt;
                 update_partial_ac(partial_ac, a, b, pos_left, a_i, b_i, n, m);
             } else {
-                // Fill left first, then right (cross-term captured from right's update)
                 a[pos_left] = a_i;
                 b[pos_left] = b_i;
                 update_partial_ac(partial_ac, a, b, pos_left, a_i, b_i, n, m);
@@ -1578,6 +1619,10 @@ fn backtrack_search_ab(
                 update_partial_ac(partial_ac, a, b, pos_right, a_j, b_j, n, m);
                 *a_sum += a_i + a_j;
                 *b_sum += b_i + b_j;
+                da_alt = alt_sign[pos_left] * a_i + alt_sign[pos_right] * a_j;
+                db_alt = alt_sign[pos_left] * b_i + alt_sign[pos_right] * b_j;
+                *a_alt_sum += da_alt;
+                *b_alt_sum += db_alt;
             }
 
             // Sum feasibility (O(1) with running sums)
@@ -1585,30 +1630,73 @@ fn backtrack_search_ab(
                 else { m - 2 * (pair_idx + 1) };
             let a_remaining = st.a - *a_sum;
             let b_remaining = st.b - *b_sum;
-            let prune = a_remaining.abs() > remaining_positions as i32
-                || b_remaining.abs() > remaining_positions as i32
-                || (a_remaining + remaining_positions as i32) % 2 != 0
-                || (b_remaining + remaining_positions as i32) % 2 != 0;
+            let a_alt_remaining = at.a_star - *a_alt_sum;
+            let b_alt_remaining = at.b_star - *b_alt_sum;
+            let rp = remaining_positions as i32;
+            let prune = a_remaining.abs() > rp
+                || b_remaining.abs() > rp
+                || (a_remaining + rp) % 2 != 0
+                || (b_remaining + rp) % 2 != 0
+                || a_alt_remaining.abs() > rp
+                || b_alt_remaining.abs() > rp
+                || (a_alt_remaining + rp) % 2 != 0
+                || (b_alt_remaining + rp) % 2 != 0;
 
             if !prune {
                 // After pair k, shift n-k is fully determined — check it
                 let ready_shift = n - pair_idx;
-                if partial_ac[ready_shift] == 0 {
+                let mut shift_ok = partial_ac[ready_shift] == 0;
+                
+                // Tight bound check on partially-filled shifts
+                if shift_ok && remaining_positions > 0 {
+                    let uf_lo = pair_idx + 1;
+                    let uf_hi = m - 2 - pair_idx;
+                    let uf_len = uf_hi - uf_lo + 1;
+                    
+                    for s in (1..ready_shift).rev() {
+                        // Unfilled-to-unfilled pairs: count of (p, p+s) both in [uf_lo, uf_hi]
+                        let both_unfilled = if s < uf_len { (uf_len - s) as i32 } else { 0 };
+                        
+                        // Unfilled-to-filled: p in [uf_lo, uf_hi], q=p±s in filled region
+                        // Filled regions: [0, uf_lo-1] and [uf_hi+1, m-1]
+                        // p-s in [0, uf_lo-1]: p in [s, s+uf_lo-1] ∩ [uf_lo, uf_hi]
+                        let left_lo = std::cmp::max(s, uf_lo);
+                        let left_hi = std::cmp::min(s + uf_lo - 1, uf_hi);
+                        let left_count = if left_hi >= left_lo { (left_hi - left_lo + 1) as i32 } else { 0 };
+                        
+                        // p+s in [uf_hi+1, m-1]: p in [uf_hi+1-s, m-1-s] ∩ [uf_lo, uf_hi]
+                        let right_lo = std::cmp::max(if uf_hi + 1 >= s { uf_hi + 1 - s } else { 0 }, uf_lo);
+                        let right_hi = std::cmp::min(if m > s { m - 1 - s } else { 0 }, uf_hi);
+                        let right_count = if m > s && right_hi >= right_lo { (right_hi - right_lo + 1) as i32 } else { 0 };
+                        
+                        let max_contrib = 2 * (both_unfilled + left_count + right_count);
+                        
+                        if partial_ac[s].abs() > max_contrib {
+                            shift_ok = false;
+                            break;
+                        }
+                    }
+                }
+                
+                if shift_ok {
                     if backtrack(pair_idx + 1, a, b, m, n, constraints,
-                                 partial_ac, a_sum, b_sum, st, at,
+                                 partial_ac, a_sum, b_sum, a_alt_sum, b_alt_sum,
+                                 alt_sign, st, at,
                                  nodes_visited, max_nodes) {
                         return true;
                     }
                 }
             }
 
-            // Undo (reverse order: right first while left still set)
+            // Undo
             if pos_left == pos_right {
                 undo_partial_ac(partial_ac, a, b, pos_left, a_i, b_i, n, m);
                 a[pos_left] = 0;
                 b[pos_left] = 0;
                 *a_sum -= a_i;
                 *b_sum -= b_i;
+                *a_alt_sum -= da_alt;
+                *b_alt_sum -= db_alt;
             } else {
                 undo_partial_ac(partial_ac, a, b, pos_right, a_j, b_j, n, m);
                 a[pos_right] = 0;
@@ -1618,20 +1706,30 @@ fn backtrack_search_ab(
                 b[pos_left] = 0;
                 *a_sum -= a_i + a_j;
                 *b_sum -= b_i + b_j;
+                *a_alt_sum -= da_alt;
+                *b_alt_sum -= db_alt;
             }
         }
 
         false
     }
 
-    if backtrack(0, &mut a, &mut b, m, n, &constraints,
-                 &mut partial_ac, &mut a_sum, &mut b_sum, st, at,
-                 &mut nodes_visited, max_nodes) {
-        Some((Sequence::new(a), Sequence::new(b)))
+    let found = backtrack(0, &mut a, &mut b, m, n, &constraints,
+                 &mut partial_ac, &mut a_sum, &mut b_sum,
+                 &mut a_alt_sum, &mut b_alt_sum, &alt_sign, st, at,
+                 &mut nodes_visited, max_nodes);
+
+    if found {
+        (Some((Sequence::new(a), Sequence::new(b))), nodes_visited)
     } else {
-        None
+        (None, nodes_visited)
     }
 }
+
+
+
+
+
 
 // ============================================================================
 // Shared: precompute_binomials (used by both cd_optimized and exhaustive_ab)
@@ -2227,7 +2325,7 @@ fn run_debug_pipeline(n: usize) {
     {
         let c_seq = Sequence::new(known_c.clone());
         let d_seq = Sequence::new(known_d.clone());
-        let ab_result = backtrack_search_ab(n, &c_seq, &d_seq, &known_st, &known_at, 10_000_000);
+        let (ab_result, _nodes) = backtrack_search_ab(n, &c_seq, &d_seq, &known_st, &known_at, 10_000_000);
         match ab_result {
             Some((a, b)) => {
                 println!("  backtrack_search_ab: FOUND");
@@ -2332,7 +2430,7 @@ fn run_pipeline_stats(n: usize) {
                     }
 
                     // Step 5: Try AB backtracking
-                    if let Some((_a, _b)) = backtrack_search_ab(n, c, d, st, at, 10_000_000) {
+                    if let Some((_a, _b)) = backtrack_search_ab(n, c, d, st, at, 10_000_000).0 {
                         println!("    >>> SOLUTION FOUND! <<<");
                         found_solution = true;
                     }
@@ -2596,7 +2694,7 @@ fn main() {
                         cd_tried.fetch_add(1, Ordering::Relaxed);
 
                         // Step 5: Backtracking A,B search (Theorem 2.2)
-                        if let Some((a, b)) = backtrack_search_ab(n, c, d, st, at, backtrack_limit) {
+                        if let Some((a, b)) = backtrack_search_ab(n, c, d, st, at, backtrack_limit).0 {
                             let base = BaseSequence::new(a, b, c.clone(), d.clone());
                             if base.is_valid() {
                                 found.store(true, Ordering::Relaxed);
