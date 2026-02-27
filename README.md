@@ -5,11 +5,17 @@ Search for Base Sequences BS(n+1, n) implementing the 5-step algorithm from Wang
 ## Quick Start
 
 ```bash
-# Build
-cargo build --release --bin find_bs_generic_v6
+# Build (native CPU optimizations + LTO)
+RUSTFLAGS="-C target-cpu=native" cargo build --release --bin find_bs_generic_v6
 
 # Run
 ./target/release/find_bs_generic_v6 25
+
+# Resume from checkpoint (e.g. after spot interruption)
+./target/release/find_bs_generic_v6 30 --resume
+
+# Control thread count (defaults to all cores)
+RAYON_NUM_THREADS=32 ./target/release/find_bs_generic_v6 30
 ```
 
 ## Algorithm

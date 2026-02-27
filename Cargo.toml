@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Implementation based on Wang & Zhu (2025)"]
 description = "Implementation of base sequence, normal sequence, and near-normal sequence search algorithms"
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
 [dependencies]
 rayon = "1.8"
 rand = "0.8"
@@ -25,3 +31,7 @@ path = "rust_code/find_bs_generic_v7.rs"
 [[bin]]
 name = "find_bs_v6_evolve1"
 path = "rust_code/find_bs_v6_evolve1.rs"
+
+[[bin]]
+name = "find_bs_v6_parallel"
+path = "rust_code/find_bs_v6_parallel.rs"

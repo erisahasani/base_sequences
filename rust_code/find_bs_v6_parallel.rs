@@ -1,11 +1,12 @@
 
-/// Generic BS(n+1, n) search - V6 Paper Pipeline Implementation
+/// Generic BS(n+1, n) search - V6 Parallel Pipeline Implementation
+/// Two-level parallelism: tuples × mod-3 solutions (optimized for 96+ cores)
 ///
-/// Usage: cargo run --release --bin find_bs_generic_v6 -- <n>
-/// Example: cargo run --release --bin find_bs_generic_v6 -- 30
+/// Usage: cargo run --release --bin find_bs_v6_parallel -- <n>
+/// Example: cargo run --release --bin find_bs_v6_parallel -- 30
 ///
 /// Resume from checkpoint:
-///   cargo run --release --bin find_bs_generic_v6 -- <n> --resume
+///   cargo run --release --bin find_bs_v6_parallel -- <n> --resume
 ///
 /// Implements the 5-step algorithm from Wang & Zhu (2025):
 /// 1. Tuple discovery (Theorem 2.1 sum constraints)
@@ -1219,8 +1220,8 @@ fn backtrack_cd_from_mod6(
     let num_pairs = pair_positions.len();
 
     // Precompute trig tables for incremental spectral check
-    // Use 128 angles - good balance of pruning vs overhead
-    let num_angles: usize = 128;
+    // More angles = tighter pruning. Critical for n>=26 where pass rates collapse.
+    let num_angles: usize = if n >= 26 { 256 } else { 128 };
     let spectral_threshold = 4.0 * (n as f64) + 2.0 + spectral_margin;
     // Flat layout: trig_cos[pos * num_angles + k], trig_sin[pos * num_angles + k]
     let trig_cos: Vec<f64> = (0..n).flat_map(|pos| {
@@ -1422,15 +1423,10 @@ fn backtrack_cd_from_mod6(
                 let mut spectral_feasible = true;
                 if unfilled > 0 {
                     let u = unfilled as f64;
-                    // Tiered: more angles closer to leaves for tighter pruning
-                    let check_angles = if unfilled <= 4 { na }
-                        else if unfilled <= 8 { na * 3 / 4 }
-                        else if unfilled <= 16 { na / 2 }
-                        else { na / 4 };
                     let st = spectral_threshold;
                     let cutoff_mag = u + st.sqrt();
                     let cutoff_sq = cutoff_mag * cutoff_mag;
-                    for k in 0..check_angles {
+                    for k in 0..na {
                         let rc2 = real_c[k] * real_c[k] + imag_c[k] * imag_c[k];
                         let rd2 = real_d[k] * real_d[k] + imag_d[k] * imag_d[k];
                         // Quick skip: neither can individually exceed threshold
@@ -1844,7 +1840,7 @@ impl Checkpoint {
     }
 
     fn filename(n: usize) -> String {
-        format!("checkpoint_v6r_n{}.json", n)
+        format!("checkpoint_v6p_n{}.json", n)
     }
 
     fn save(&self) -> std::io::Result<()> {
@@ -2519,7 +2515,7 @@ fn main() {
         return;
     }
 
-    println!("BS({},{}) - V6 Paper Pipeline Search", n + 1, n);
+    println!("BS({},{}) - V6 Parallel Pipeline Search", n + 1, n);
     println!("==============================================\n");
 
     let num_threads = rayon::current_num_threads();
@@ -2531,7 +2527,7 @@ fn main() {
     println!("Configuration for n={}:", n);
     println!("  Spectral margin: 0.5");
     println!("  AB backtrack limit: {:.0e}", backtrack_limit as f64);
-    println!("  Streaming pipeline: no caps on mod-3, mod-6, or CD enumeration");
+    println!("  Two-level parallelism: tuples x mod-3 solutions (nested rayon)");
     println!();
 
     println!("Step 1: Find valid tuples...");
@@ -2599,6 +2595,7 @@ fn main() {
     // Mod-3/mod-6 counters (needed by both progress thread and search)
     let total_mod3_found = Arc::new(AtomicU64::new(0));
     let total_mod6_found = Arc::new(AtomicU64::new(0));
+    let cd_headroom_skip = Arc::new(AtomicU64::new(0));
 
     // Signal for progress thread termination
     let search_done = Arc::new(AtomicBool::new(false));
@@ -2611,8 +2608,7 @@ fn main() {
     let cd_clone = Arc::clone(&cd_tried);
     let cd_total_clone = Arc::clone(&cd_total);
     let checkpoint_clone = Arc::clone(&checkpoint_mutex);
-    let total_mod3_clone = Arc::clone(&total_mod3_found);
-    let total_mod6_clone = Arc::clone(&total_mod6_found);
+    let headroom_skip_clone = Arc::clone(&cd_headroom_skip);
     let total_tuples = sorted_arc.len();
     let start_clone = start.clone();
 
@@ -2641,15 +2637,16 @@ fn main() {
             last_tried = tried;
             last_time = Instant::now();
 
-            let m3 = total_mod3_clone.load(Ordering::Relaxed);
-            let m6 = total_mod6_clone.load(Ordering::Relaxed);
-            println!("  [{:>4}/{:>4} +{}] | {:.2e} pass / {:.2e} checked ({:.1}%) | {:.1}/s | m3:{:.1e} m6:{:.1e} | {:.1}h",
+            let hr_skip = headroom_skip_clone.load(Ordering::Relaxed);
+            let ab_attempted = tried - hr_skip;
+            println!("  [{:>4}/{:>4} +{}] | {:.2e} pass / {:.2e} checked ({:.1}%) | AB:{:.2e} hr_skip:{:.2e} | {:.1}/s | {:.1}h",
                 done, total_tuples, active,
                 tried as f64,
                 total as f64,
                 pass_rate,
+                ab_attempted as f64,
+                hr_skip as f64,
                 cd_per_sec,
-                m3 as f64, m6 as f64,
                 elapsed / 3600.0);
 
             // Save checkpoint periodically (every 5 minutes)
@@ -2688,18 +2685,19 @@ fn main() {
 
             tuples_active.fetch_add(1, Ordering::Relaxed);
             let (st, at) = &sorted_arc[tuple_idx];
-            let mut result_for_tuple: Option<(BaseSequence, usize, SumTuple, AltSumTuple)> = None;
-            let mut mod3_idx = 0usize;
 
-            // Step 2: Mod-3 streaming (Theorem 2.3, m=3)
-            enumerate_mod3_solutions(n, st, at, &mut |mod3_sol| {
-                if found.load(Ordering::Relaxed) { return false; }
-                total_mod3_found.fetch_add(1, Ordering::Relaxed);
-                let cur_mod3_idx = mod3_idx;
-                mod3_idx += 1;
+            // Step 2: Collect mod-3 solutions (fast, ~48 bytes each)
+            let mod3_sols = collect_mod3_solutions(n, st, at, usize::MAX);
+            total_mod3_found.fetch_add(mod3_sols.len() as u64, Ordering::Relaxed);
+
+            // INNER PARALLELISM: parallel over mod-3 solutions
+            // Rayon work-stealing distributes these across idle threads
+            let result = mod3_sols.into_par_iter().enumerate().find_map_any(|(m3_idx, mod3_sol)| {
+                if found.load(Ordering::Relaxed) { return None; }
+                let mut local_result: Option<(BaseSequence, usize, SumTuple, AltSumTuple)> = None;
 
                 // Step 3: Mod-6 CD streaming (Theorem 2.3, m=6)
-                enumerate_mod6_cd_solutions(n, mod3_sol, cur_mod3_idx, &mut |mod6_sol| {
+                enumerate_mod6_cd_solutions(n, &mod3_sol, m3_idx, &mut |mod6_sol| {
                     if found.load(Ordering::Relaxed) { return false; }
                     total_mod6_found.fetch_add(1, Ordering::Relaxed);
 
@@ -2709,13 +2707,23 @@ fn main() {
 
                         cd_tried.fetch_add(1, Ordering::Relaxed);
 
+                        // AB headroom pre-filter: skip CDs that leave too little
+                        // spectral room for A,B (they'd need |A(z)|²+|B(z)|² < threshold)
+                        if n > 20 {
+                            let headroom = compute_ab_headroom(c, d);
+                            if headroom < 1.0 {
+                                cd_headroom_skip.fetch_add(1, Ordering::Relaxed);
+                                return true; // skip this CD, continue to next
+                            }
+                        }
+
                         // Step 5: Backtracking A,B search (Theorem 2.2)
                         if let Some((a, b)) = backtrack_search_ab(n, c, d, st, at, backtrack_limit).0 {
                             let base = BaseSequence::new(a, b, c.clone(), d.clone());
                             if base.is_valid() {
                                 found.store(true, Ordering::Relaxed);
                                 Checkpoint::delete(n);
-                                result_for_tuple = Some((base, tuple_idx, st.clone(), at.clone()));
+                                local_result = Some((base, tuple_idx, st.clone(), at.clone()));
                                 return false; // stop
                             }
                         }
@@ -2725,13 +2733,13 @@ fn main() {
                     !found.load(Ordering::Relaxed)
                 });
 
-                !found.load(Ordering::Relaxed)
+                local_result
             });
 
             tuples_active.fetch_sub(1, Ordering::Relaxed);
 
-            if result_for_tuple.is_some() {
-                return result_for_tuple;
+            if result.is_some() {
+                return result;
             }
 
             tuples_done.fetch_add(1, Ordering::Relaxed);
@@ -2818,7 +2826,7 @@ fn print_solution(
     }
 
     // Save
-    let filename = format!("BS_{}_{}_V6_{:.0}s.txt", n + 1, n, elapsed_secs);
+    let filename = format!("BS_{}_{}_V6P_{:.0}s.txt", n + 1, n, elapsed_secs);
     if let Ok(mut f) = File::create(&filename) {
         writeln!(f, "BS({},{}) Solution - V6 Aggressive", n + 1, n).ok();
         writeln!(f, "====================================").ok();
