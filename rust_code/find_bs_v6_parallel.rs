@@ -1,12 +1,17 @@
 
-/// Generic BS(n+1, n) search - V6 Parallel Pipeline Implementation
-/// Two-level parallelism: tuples × mod-3 solutions (optimized for 96+ cores)
+/// BS(n+1, n) search - N44 Multi-Instance Implementation
+/// Optimized for large n (n=44+) across multiple EC2 instances
+/// Two-level parallelism: tuples × mod-3 solutions (optimized for 192+ cores)
 ///
-/// Usage: cargo run --release --bin find_bs_v6_parallel -- <n>
-/// Example: cargo run --release --bin find_bs_v6_parallel -- 30
+/// Usage: cargo run --release --bin find_bs_n44_13_instances -- <n> --instance X/Y
+/// Example: cargo run --release --bin find_bs_n44_13_instances -- 44 --instance 1/3
 ///
-/// Resume from checkpoint:
-///   cargo run --release --bin find_bs_v6_parallel -- <n> --resume
+/// Options:
+///   --instance X/Y      Split tuples across Y instances, run instance X
+///   --tuple-range S-E   Manual tuple range (alternative to --instance)
+///   --ab-limit N        AB backtrack node limit (default: unlimited)
+///   --ab-limit unlimited  Explicit unlimited AB backtracking
+///   --resume            Resume from checkpoint
 ///
 /// Implements the 5-step algorithm from Wang & Zhu (2025):
 /// 1. Tuple discovery (Theorem 2.1 sum constraints)
@@ -573,7 +578,7 @@ fn collect_cd_from_mod6(n: usize, mod6_sol: &Mod6CDSolution, spectral_margin: f6
     let mut results = Vec::new();
     let counter = AtomicU64::new(0);
     backtrack_cd_from_mod6(n, mod6_sol, spectral_margin, &mut |c, d| {
-        results.push((c.clone(), d.clone()));
+        results.push((Sequence::new(c.to_vec()), Sequence::new(d.to_vec())));
         results.len() < max
     }, &counter);
     (results, counter.load(Ordering::Relaxed))
@@ -873,13 +878,7 @@ fn enumerate_mod6_cd_solutions<F: FnMut(&Mod6CDSolution) -> bool>(
             if !cd_mod4_ok { continue; }
 
             // Check that at least one valid AB mod-6 exists (feasibility check)
-            let feasible = if n <= 20 {
-                check_mod6_ab_feasible(n, mod3_sol, p_cand, q_cand, target_sq - pq_sq)
-            } else if n <= 35 {
-                check_mod6_ab_feasible_sampled(n, mod3_sol, p_cand, q_cand, target_sq - pq_sq, 50_000)
-            } else {
-                true // Skip for very large n
-            };
+            let feasible = check_mod6_ab_feasible(n, mod3_sol, p_cand, q_cand, target_sq - pq_sq);
             if feasible {
                 let sol = Mod6CDSolution {
                     p: *p_cand,
@@ -1033,111 +1032,6 @@ fn check_mod6_ab_feasible(
     false
 }
 
-/// Probabilistic AB feasibility check for mod-6 solutions when n > 25.
-/// Randomly samples K,R mod-6 refinements to check if any valid AB exists.
-fn check_mod6_ab_feasible_sampled(
-    n: usize,
-    mod3_sol: &Mod3Solution,
-    p6: &[i32; 6],
-    q6: &[i32; 6],
-    kr_sq_budget: i32,
-    num_samples: usize,
-) -> bool {
-    use rand::Rng;
-    let m: usize = 6;
-    let m_ab = n + 1;
-    let mut rng = rand::thread_rng();
-    let target_sq_full = (4 * n + 2) as i32;
-
-    // Compute bounds for K,R at mod-6
-    let mut k_bounds = [(0i32, 0i32, 0i32); 6];
-    let mut r_bounds = [(0i32, 0i32, 0i32); 6];
-    for i in 1..=6 {
-        k_bounds[i - 1] = partial_sum_bound(m_ab, i, m);
-        r_bounds[i - 1] = partial_sum_bound(m_ab, i, m);
-    }
-
-    for _ in 0..num_samples {
-        // Random K refinement: for each i=0,1,2 pick k_{i,6}, derive k_{i+3,6}
-        let mut k = [0i32; 6];
-        let mut valid = true;
-        for i_mod3 in 0..3 {
-            let target = mod3_sol.k[i_mod3];
-            let (lo_a, hi_a, par_a) = k_bounds[i_mod3];
-            // Compute first valid value with correct parity
-            let first_valid = lo_a + ((par_a - ((lo_a % 2 + 2) % 2)) % 2 + 2) % 2;
-            let num_vals = if first_valid > hi_a { 0 } else { ((hi_a - first_valid) / 2 + 1) as usize };
-            if num_vals == 0 { valid = false; break; }
-            let ka = first_valid + 2 * rng.gen_range(0..num_vals as i32);
-            let kb = target - ka;
-            let (lo_b, hi_b, par_b) = k_bounds[i_mod3 + 3];
-            if kb < lo_b || kb > hi_b || ((kb % 2 + 2) % 2) != par_b { valid = false; break; }
-            k[i_mod3] = ka;
-            k[i_mod3 + 3] = kb;
-        }
-        if !valid { continue; }
-        let k_sq: i32 = k.iter().map(|x| x * x).sum();
-        if k_sq > kr_sq_budget { continue; }
-
-        // Random R refinement
-        let mut r = [0i32; 6];
-        valid = true;
-        for i_mod3 in 0..3 {
-            let target = mod3_sol.r[i_mod3];
-            let (lo_a, hi_a, par_a) = r_bounds[i_mod3];
-            let first_valid = lo_a + ((par_a - ((lo_a % 2 + 2) % 2)) % 2 + 2) % 2;
-            let num_vals = if first_valid > hi_a { 0 } else { ((hi_a - first_valid) / 2 + 1) as usize };
-            if num_vals == 0 { valid = false; break; }
-            let ra = first_valid + 2 * rng.gen_range(0..num_vals as i32);
-            let rb = target - ra;
-            let (lo_b, hi_b, par_b) = r_bounds[i_mod3 + 3];
-            if rb < lo_b || rb > hi_b || ((rb % 2 + 2) % 2) != par_b { valid = false; break; }
-            r[i_mod3] = ra;
-            r[i_mod3 + 3] = rb;
-        }
-        if !valid { continue; }
-        let r_sq: i32 = r.iter().map(|x| x * x).sum();
-        if k_sq + r_sq != kr_sq_budget { continue; }
-
-        // Check total sum-of-squares
-        let total_sq: i32 = k_sq + r_sq
-            + p6.iter().map(|x| x * x).sum::<i32>()
-            + q6.iter().map(|x| x * x).sum::<i32>();
-        if total_sq != target_sq_full { continue; }
-
-        // Check orthogonality at m=6
-        let mut ortho_ok = true;
-        for s in 1..=3 {
-            let ortho = partial_autocorr(&k, s) + partial_autocorr(&r, s)
-                + partial_autocorr(p6, s) + partial_autocorr(q6, s)
-                + partial_autocorr(&k, m - s) + partial_autocorr(&r, m - s)
-                + partial_autocorr(p6, m - s) + partial_autocorr(q6, m - s);
-            if ortho != 0 { ortho_ok = false; break; }
-        }
-        if !ortho_ok { continue; }
-
-        // Check Eq 2.12 for AB at m=6
-        let res_n1 = if (n + 1) % m == 0 { m } else { (n + 1) % m };
-        let ab_pair1_sum = k[0] + r[0] + k[res_n1 - 1] + r[res_n1 - 1];
-        let ab_pair1_target = if n % m != 0 { 2 } else { 0 };
-        if ((ab_pair1_sum % 4) + 4) % 4 != ab_pair1_target { continue; }
-
-        let overlap_j_ab6 = res_n1;
-        let mut ab_mod4_ok = true;
-        for j in 2..=m {
-            if j == overlap_j_ab6 { continue; }
-            let res_pair = if (n + 2 - j) % m == 0 { m } else { (n + 2 - j) % m };
-            let sum_j = k[j - 1] + r[j - 1] + k[res_pair - 1] + r[res_pair - 1];
-            if ((sum_j % 4) + 4) % 4 != 0 { ab_mod4_ok = false; break; }
-        }
-        if !ab_mod4_ok { continue; }
-
-        return true;
-    }
-    false
-}
-
-
 /// Deterministic backtracking to construct C,D sequences satisfying both
 /// Theorem 2.2 paired constraints AND target mod-6 partial sums.
 /// Integrates spectral filtering: maintains Hall polynomial incrementally,
@@ -1148,7 +1042,7 @@ fn backtrack_cd_from_mod6(
     n: usize,
     mod6_sol: &Mod6CDSolution,
     spectral_margin: f64,
-    callback: &mut dyn FnMut(&Sequence, &Sequence) -> bool,
+    callback: &mut dyn FnMut(&[i32], &[i32]) -> bool,
     cd_checked_counter: &AtomicU64,
 ) {
     let m = 6usize;
@@ -1220,8 +1114,8 @@ fn backtrack_cd_from_mod6(
     let num_pairs = pair_positions.len();
 
     // Precompute trig tables for incremental spectral check
-    // More angles = tighter pruning. Critical for n>=26 where pass rates collapse.
-    let num_angles: usize = if n >= 26 { 256 } else { 128 };
+    // Paper Step 4: θ = jπ/100 for j=1,...,200 (200 angles)
+    let num_angles: usize = 200;
     let spectral_threshold = 4.0 * (n as f64) + 2.0 + spectral_margin;
     // Flat layout: trig_cos[pos * num_angles + k], trig_sin[pos * num_angles + k]
     let trig_cos: Vec<f64> = (0..n).flat_map(|pos| {
@@ -1258,7 +1152,7 @@ fn backtrack_cd_from_mod6(
         has_middle: bool,
         mid_pos: usize,
         mid_class: usize,
-        callback: &mut dyn FnMut(&Sequence, &Sequence) -> bool,
+        callback: &mut dyn FnMut(&[i32], &[i32]) -> bool,
         stop: &mut bool,
         trig_cos: &[f64],
         trig_sin: &[f64],
@@ -1315,9 +1209,7 @@ fn backtrack_cd_from_mod6(
                             if spectral_ok {
                                 c_vals[mid_pos] = cm;
                                 d_vals[mid_pos] = dm;
-                                let c_seq = Sequence::new(c_vals.clone());
-                                let d_seq = Sequence::new(d_vals.clone());
-                                if !callback(&c_seq, &d_seq) { *stop = true; }
+                                if !callback(c_vals, d_vals) { *stop = true; }
                             }
 
                             // Undo spectral for middle
@@ -1354,9 +1246,7 @@ fn backtrack_cd_from_mod6(
                         }
                     }
                     if spectral_ok {
-                        let c_seq = Sequence::new(c_vals.clone());
-                        let d_seq = Sequence::new(d_vals.clone());
-                        if !callback(&c_seq, &d_seq) { *stop = true; }
+                        if !callback(c_vals, d_vals) { *stop = true; }
                     }
                 }
             }
@@ -1417,16 +1307,22 @@ fn backtrack_cd_from_mod6(
                     imag_d[k] += di_f * sl + dj_f * sr;
                 }
 
-                // Spectral lower bound pruning - apply at all levels
+                // Spectral lower bound pruning - tiered angles by tree depth
+                // Early levels: bound is loose (u large), fewer angles suffice
+                // Near leaves: bound is tight, full 200 angles for maximum pruning
                 let unfilled = 2 * (num_pairs - pair_idx - 1)
                     + if has_middle { 1 } else { 0 };
                 let mut spectral_feasible = true;
                 if unfilled > 0 {
                     let u = unfilled as f64;
+                    let check_angles = if unfilled <= 4 { na }
+                        else if unfilled <= 8 { na * 3 / 4 }
+                        else if unfilled <= 16 { na / 2 }
+                        else { na / 4 };
                     let st = spectral_threshold;
                     let cutoff_mag = u + st.sqrt();
                     let cutoff_sq = cutoff_mag * cutoff_mag;
-                    for k in 0..na {
+                    for k in 0..check_angles {
                         let rc2 = real_c[k] * real_c[k] + imag_c[k] * imag_c[k];
                         let rd2 = real_d[k] * real_d[k] + imag_d[k] * imag_d[k];
                         // Quick skip: neither can individually exceed threshold
@@ -1506,12 +1402,10 @@ fn backtrack_cd_from_mod6(
 /// Uses incremental autocorrelation tracking: O(n) per node instead of O(n²).
 /// Positions filled outside-in; after pair k, shift n-k becomes fully determined.
 
-
-// backtrack_search_ab has been improved
 fn backtrack_search_ab(
     n: usize,
-    c: &Sequence,
-    d: &Sequence,
+    c: &[i32],
+    d: &[i32],
     st: &SumTuple,
     at: &AltSumTuple,
     max_nodes: u64,
@@ -1522,7 +1416,13 @@ fn backtrack_search_ab(
     let cd_autocorr = {
         let mut v = vec![0i32; n + 1];
         for shift in 1..=n {
-            v[shift] = c.autocorrelation(shift) + d.autocorrelation(shift);
+            let cn = c.len();
+            let mut sc = 0i32;
+            for j in 0..(cn - shift) { sc += c[j] * c[j + shift]; }
+            let dn = d.len();
+            let mut sd = 0i32;
+            for j in 0..(dn - shift) { sd += d[j] * d[j + shift]; }
+            v[shift] = sc + sd;
         }
         v
     };
@@ -1540,12 +1440,12 @@ fn backtrack_search_ab(
     let mut a_alt_sum = 0i32; // running alternating sum of a
     let mut b_alt_sum = 0i32; // running alternating sum of b
 
-    // Add contributions of newly-filled position `pos` to all shifts.
+    // Add contributions of newly-filled position `pos` to shifts 1..=max_shift.
     fn update_partial_ac(
         partial_ac: &mut [i32], a: &[i32], b: &[i32],
-        pos: usize, a_val: i32, b_val: i32, n: usize, m: usize,
+        pos: usize, a_val: i32, b_val: i32, max_shift: usize, m: usize,
     ) {
-        for s in 1..=n {
+        for s in 1..=max_shift {
             if pos >= s && a[pos - s] != 0 {
                 partial_ac[s] += a[pos - s] * a_val + b[pos - s] * b_val;
             }
@@ -1558,9 +1458,9 @@ fn backtrack_search_ab(
     // Reverse the update for position `pos` (called during backtrack undo).
     fn undo_partial_ac(
         partial_ac: &mut [i32], a: &[i32], b: &[i32],
-        pos: usize, a_val: i32, b_val: i32, n: usize, m: usize,
+        pos: usize, a_val: i32, b_val: i32, max_shift: usize, m: usize,
     ) {
-        for s in 1..=n {
+        for s in 1..=max_shift {
             if pos >= s && a[pos - s] != 0 {
                 partial_ac[s] -= a[pos - s] * a_val + b[pos - s] * b_val;
             }
@@ -1572,6 +1472,34 @@ fn backtrack_search_ab(
 
     // Precompute alternating signs for each position
     let alt_sign: Vec<i32> = (0..m).map(|i| if i % 2 == 0 { 1 } else { -1 }).collect();
+
+    // Symmetry breaking flags for AB backtracking (depth 0 only)
+    // Reversal: reverse(A), reverse(B) is a same-tuple symmetry only when n is even
+    // (alt_sum(reverse(X)) = (-1)^{m-1} * alt_sum(X), and m-1=n is even iff n is even)
+    let use_reversal = n % 2 == 0;
+    // A<->B swap: swapping A,B gives same tuple only when sum and alt-sum match
+    let ab_symmetric = st.a == st.b && at.a_star == at.b_star;
+
+    // Precompute max_contrib table for tight bound check.
+    let num_pairs_pre = constraints.len();
+    let max_contrib_table: Vec<Vec<i32>> = (0..num_pairs_pre).map(|pidx| {
+        let ready_shift = n - pidx;
+        let uf_lo = pidx + 1;
+        (0..=n).map(|s| {
+            if s == 0 || s >= ready_shift || pidx + 2 > m { return 0; }
+            let uf_hi = m - 2 - pidx;
+            if uf_hi < uf_lo { return 0; }
+            let uf_len = uf_hi - uf_lo + 1;
+            let both_unfilled = if s < uf_len { (uf_len - s) as i32 } else { 0 };
+            let left_lo = std::cmp::max(s, uf_lo);
+            let left_hi = std::cmp::min(s + uf_lo - 1, uf_hi);
+            let left_count = if left_hi >= left_lo { (left_hi - left_lo + 1) as i32 } else { 0 };
+            let right_lo = std::cmp::max(if uf_hi + 1 >= s { uf_hi + 1 - s } else { 0 }, uf_lo);
+            let right_hi = std::cmp::min(if m > s { m - 1 - s } else { 0 }, uf_hi);
+            let right_count = if m > s && right_hi >= right_lo { (right_hi - right_lo + 1) as i32 } else { 0 };
+            2 * (both_unfilled + left_count + right_count)
+        }).collect()
+    }).collect();
 
     fn backtrack(
         pair_idx: usize,
@@ -1590,17 +1518,16 @@ fn backtrack_search_ab(
         at: &AltSumTuple,
         nodes_visited: &mut u64,
         max_nodes: u64,
+        use_reversal: bool,
+        ab_symmetric: bool,
+        max_contrib_table: &[Vec<i32>],
     ) -> bool {
         if *nodes_visited >= max_nodes { return false; }
 
         let num_pairs = constraints.len();
         if pair_idx >= num_pairs {
-            // All positions filled — check final constraints
             if *a_sum != st.a || *b_sum != st.b { return false; }
             if *a_alt_sum != at.a_star || *b_alt_sum != at.b_star { return false; }
-
-            // Shifts n..=n-num_pairs+1 were checked during recursion.
-            // Check remaining shifts 1..=n-num_pairs.
             for s in 1..=(n.saturating_sub(num_pairs)) {
                 if partial_ac[s] != 0 { return false; }
             }
@@ -1609,104 +1536,211 @@ fn backtrack_search_ab(
 
         let pos_left = pair_idx;
         let pos_right = m - 1 - pair_idx;
+        let is_middle = pos_left == pos_right;
+        let ready_shift = n - pair_idx;
+        let remaining_positions = if is_middle { 0 } else { m - 2 * (pair_idx + 1) };
+        let rp = remaining_positions as i32;
+
+        // --- Pre-filter coefficients for ready_shift (computed once per depth) ---
+        let mut cl_a = 0i32;
+        let mut cl_b = 0i32;
+        let mut cr_a = 0i32;
+        let mut cr_b = 0i32;
+
+        if !is_middle {
+            if pos_left >= ready_shift && a[pos_left - ready_shift] != 0 {
+                cl_a += a[pos_left - ready_shift];
+                cl_b += b[pos_left - ready_shift];
+            }
+            if pos_left + ready_shift < m {
+                let nb = pos_left + ready_shift;
+                if nb != pos_right && a[nb] != 0 {
+                    cl_a += a[nb];
+                    cl_b += b[nb];
+                }
+            }
+            if pos_right >= ready_shift {
+                let nb = pos_right - ready_shift;
+                if nb != pos_left && a[nb] != 0 {
+                    cr_a += a[nb];
+                    cr_b += b[nb];
+                }
+            }
+            if pos_right + ready_shift < m {
+                let nb = pos_right + ready_shift;
+                if nb != pos_left && a[nb] != 0 {
+                    cr_a += a[nb];
+                    cr_b += b[nb];
+                }
+            }
+        } else {
+            if pos_left >= ready_shift && a[pos_left - ready_shift] != 0 {
+                cl_a += a[pos_left - ready_shift];
+                cl_b += b[pos_left - ready_shift];
+            }
+            if pos_left + ready_shift < m && a[pos_left + ready_shift] != 0 {
+                cl_a += a[pos_left + ready_shift];
+                cl_b += b[pos_left + ready_shift];
+            }
+        }
+
+        let has_cross = !is_middle && (
+            (pos_right >= ready_shift && pos_right - ready_shift == pos_left)
+            || (pos_right + ready_shift < m && pos_right + ready_shift == pos_left)
+        );
+
+        let required_delta = -partial_ac[ready_shift];
 
         for &(a_i, b_i, a_j, b_j) in &constraints[pair_idx] {
             *nodes_visited += 1;
             if *nodes_visited >= max_nodes { return false; }
 
-            // Assign positions and update partial_ac incrementally
-            let (da_alt, db_alt);
-            if pos_left == pos_right {
+            // Symmetry breaking: at depth 0, only explore canonical orbit representative
+            if pair_idx == 0 {
+                let option = (a_i, b_i, a_j, b_j);
+                let mut canonical = option;
+                if use_reversal {
+                    let rev = (a_j, b_j, a_i, b_i);
+                    if rev < canonical { canonical = rev; }
+                }
+                if ab_symmetric {
+                    let swp = (b_i, a_i, b_j, a_j);
+                    if swp < canonical { canonical = swp; }
+                }
+                if use_reversal && ab_symmetric {
+                    let rev_swp = (b_j, a_j, b_i, a_i);
+                    if rev_swp < canonical { canonical = rev_swp; }
+                }
+                if option != canonical {
+                    continue;
+                }
+            }
+
+            // 1. Ready-shift pre-filter: O(1), skip options that can't zero ready shift
+            let delta = a_i * cl_a + b_i * cl_b + a_j * cr_a + b_j * cr_b
+                      + if has_cross { a_i * a_j + b_i * b_j } else { 0 };
+            if delta != required_delta { continue; }
+
+            // 2. Sum/alt-sum feasibility: O(1), check without modifying state
+            let da_alt;
+            let db_alt;
+            if is_middle {
+                da_alt = alt_sign[pos_left] * a_i;
+                db_alt = alt_sign[pos_left] * b_i;
+                if *a_sum + a_i != st.a || *b_sum + b_i != st.b { continue; }
+                if *a_alt_sum + da_alt != at.a_star || *b_alt_sum + db_alt != at.b_star { continue; }
+            } else {
+                da_alt = alt_sign[pos_left] * a_i + alt_sign[pos_right] * a_j;
+                db_alt = alt_sign[pos_left] * b_i + alt_sign[pos_right] * b_j;
+                let ar = st.a - *a_sum - a_i - a_j;
+                let br = st.b - *b_sum - b_i - b_j;
+                let aar = at.a_star - *a_alt_sum - da_alt;
+                let bar = at.b_star - *b_alt_sum - db_alt;
+                if ar.abs() > rp || br.abs() > rp
+                    || (ar + rp) % 2 != 0 || (br + rp) % 2 != 0
+                    || aar.abs() > rp || bar.abs() > rp
+                    || (aar + rp) % 2 != 0 || (bar + rp) % 2 != 0
+                { continue; }
+            }
+
+            // 3. Update: O(n-pair_idx) — only reached by options passing both filters
+            if is_middle {
                 a[pos_left] = a_i;
                 b[pos_left] = b_i;
                 *a_sum += a_i;
                 *b_sum += b_i;
-                da_alt = alt_sign[pos_left] * a_i;
-                db_alt = alt_sign[pos_left] * b_i;
                 *a_alt_sum += da_alt;
                 *b_alt_sum += db_alt;
-                update_partial_ac(partial_ac, a, b, pos_left, a_i, b_i, n, m);
+                update_partial_ac(partial_ac, a, b, pos_left, a_i, b_i, n - pair_idx, m);
             } else {
                 a[pos_left] = a_i;
                 b[pos_left] = b_i;
-                update_partial_ac(partial_ac, a, b, pos_left, a_i, b_i, n, m);
+                update_partial_ac(partial_ac, a, b, pos_left, a_i, b_i, n - pair_idx, m);
                 a[pos_right] = a_j;
                 b[pos_right] = b_j;
-                update_partial_ac(partial_ac, a, b, pos_right, a_j, b_j, n, m);
+                update_partial_ac(partial_ac, a, b, pos_right, a_j, b_j, n - pair_idx, m);
                 *a_sum += a_i + a_j;
                 *b_sum += b_i + b_j;
-                da_alt = alt_sign[pos_left] * a_i + alt_sign[pos_right] * a_j;
-                db_alt = alt_sign[pos_left] * b_i + alt_sign[pos_right] * b_j;
                 *a_alt_sum += da_alt;
                 *b_alt_sum += db_alt;
             }
 
-            // Sum feasibility (O(1) with running sums)
-            let remaining_positions = if pos_left == pos_right { 0 }
-                else { m - 2 * (pair_idx + 1) };
-            let a_remaining = st.a - *a_sum;
-            let b_remaining = st.b - *b_sum;
-            let a_alt_remaining = at.a_star - *a_alt_sum;
-            let b_alt_remaining = at.b_star - *b_alt_sum;
-            let rp = remaining_positions as i32;
-            let prune = a_remaining.abs() > rp
-                || b_remaining.abs() > rp
-                || (a_remaining + rp) % 2 != 0
-                || (b_remaining + rp) % 2 != 0
-                || a_alt_remaining.abs() > rp
-                || b_alt_remaining.abs() > rp
-                || (a_alt_remaining + rp) % 2 != 0
-                || (b_alt_remaining + rp) % 2 != 0;
-
-            if !prune {
-                // After pair k, shift n-k is fully determined — check it
-                let ready_shift = n - pair_idx;
-                let mut shift_ok = partial_ac[ready_shift] == 0;
-                
-                // Tight bound check on partially-filled shifts
-                if shift_ok && remaining_positions > 0 {
-                    let uf_lo = pair_idx + 1;
-                    let uf_hi = m - 2 - pair_idx;
-                    let uf_len = uf_hi - uf_lo + 1;
-                    
-                    for s in (1..ready_shift).rev() {
-                        // Unfilled-to-unfilled pairs: count of (p, p+s) both in [uf_lo, uf_hi]
-                        let both_unfilled = if s < uf_len { (uf_len - s) as i32 } else { 0 };
-                        
-                        // Unfilled-to-filled: p in [uf_lo, uf_hi], q=p±s in filled region
-                        // Filled regions: [0, uf_lo-1] and [uf_hi+1, m-1]
-                        // p-s in [0, uf_lo-1]: p in [s, s+uf_lo-1] ∩ [uf_lo, uf_hi]
-                        let left_lo = std::cmp::max(s, uf_lo);
-                        let left_hi = std::cmp::min(s + uf_lo - 1, uf_hi);
-                        let left_count = if left_hi >= left_lo { (left_hi - left_lo + 1) as i32 } else { 0 };
-                        
-                        // p+s in [uf_hi+1, m-1]: p in [uf_hi+1-s, m-1-s] ∩ [uf_lo, uf_hi]
-                        let right_lo = std::cmp::max(if uf_hi + 1 >= s { uf_hi + 1 - s } else { 0 }, uf_lo);
-                        let right_hi = std::cmp::min(if m > s { m - 1 - s } else { 0 }, uf_hi);
-                        let right_count = if m > s && right_hi >= right_lo { (right_hi - right_lo + 1) as i32 } else { 0 };
-                        
-                        let max_contrib = 2 * (both_unfilled + left_count + right_count);
-                        
-                        if partial_ac[s].abs() > max_contrib {
-                            shift_ok = false;
-                            break;
-                        }
-                    }
-                }
-                
-                if shift_ok {
-                    if backtrack(pair_idx + 1, a, b, m, n, constraints,
-                                 partial_ac, a_sum, b_sum, a_alt_sum, b_alt_sum,
-                                 alt_sign, st, at,
-                                 nodes_visited, max_nodes) {
-                        return true;
+            // 4. Tight bound check (ready_shift guaranteed 0 by pre-filter)
+            let mut shift_ok = true;
+            if remaining_positions > 0 {
+                for s in (1..ready_shift).rev() {
+                    if partial_ac[s].abs() > max_contrib_table[pair_idx][s] {
+                        shift_ok = false;
+                        break;
                     }
                 }
             }
 
-            // Undo
-            if pos_left == pos_right {
-                undo_partial_ac(partial_ac, a, b, pos_left, a_i, b_i, n, m);
+            // 5. Exact look-ahead: can ANY next-depth option zero next ready shift?
+            if shift_ok && pair_idx + 1 < num_pairs {
+                let next_ready = ready_shift - 1;
+                if next_ready >= 1 {
+                    let next_left = pair_idx + 1;
+                    let next_right = m - 2 - pair_idx;
+                    let req = -partial_ac[next_ready];
+
+                    let mut nla = 0i32;
+                    let mut nlb = 0i32;
+                    if next_left >= next_ready && a[next_left - next_ready] != 0 {
+                        nla += a[next_left - next_ready];
+                        nlb += b[next_left - next_ready];
+                    }
+                    if next_left + next_ready < m && a[next_left + next_ready] != 0 {
+                        nla += a[next_left + next_ready];
+                        nlb += b[next_left + next_ready];
+                    }
+
+                    if next_left == next_right {
+                        let mut any_ok = false;
+                        for &ai in &[-1i32, 1] {
+                            for &bi in &[-1i32, 1] {
+                                if ai * nla + bi * nlb == req { any_ok = true; break; }
+                            }
+                            if any_ok { break; }
+                        }
+                        if !any_ok { shift_ok = false; }
+                    } else {
+                        let mut nra = 0i32;
+                        let mut nrb = 0i32;
+                        if next_right >= next_ready && a[next_right - next_ready] != 0 {
+                            nra += a[next_right - next_ready];
+                            nrb += b[next_right - next_ready];
+                        }
+                        if next_right + next_ready < m && a[next_right + next_ready] != 0 {
+                            nra += a[next_right + next_ready];
+                            nrb += b[next_right + next_ready];
+                        }
+                        let mut any_ok = false;
+                        for &(nai, nbi, naj, nbj) in &constraints[pair_idx + 1] {
+                            if nai * nla + nbi * nlb + naj * nra + nbj * nrb == req {
+                                any_ok = true;
+                                break;
+                            }
+                        }
+                        if !any_ok { shift_ok = false; }
+                    }
+                }
+            }
+
+            if shift_ok {
+                if backtrack(pair_idx + 1, a, b, m, n, constraints,
+                             partial_ac, a_sum, b_sum, a_alt_sum, b_alt_sum,
+                             alt_sign, st, at,
+                             nodes_visited, max_nodes,
+                             use_reversal, ab_symmetric,
+                             max_contrib_table) {
+                    return true;
+                }
+            }
+
+            // 6. Undo
+            if is_middle {
+                undo_partial_ac(partial_ac, a, b, pos_left, a_i, b_i, n - pair_idx, m);
                 a[pos_left] = 0;
                 b[pos_left] = 0;
                 *a_sum -= a_i;
@@ -1714,10 +1748,10 @@ fn backtrack_search_ab(
                 *a_alt_sum -= da_alt;
                 *b_alt_sum -= db_alt;
             } else {
-                undo_partial_ac(partial_ac, a, b, pos_right, a_j, b_j, n, m);
+                undo_partial_ac(partial_ac, a, b, pos_right, a_j, b_j, n - pair_idx, m);
                 a[pos_right] = 0;
                 b[pos_right] = 0;
-                undo_partial_ac(partial_ac, a, b, pos_left, a_i, b_i, n, m);
+                undo_partial_ac(partial_ac, a, b, pos_left, a_i, b_i, n - pair_idx, m);
                 a[pos_left] = 0;
                 b[pos_left] = 0;
                 *a_sum -= a_i + a_j;
@@ -1733,7 +1767,9 @@ fn backtrack_search_ab(
     let found = backtrack(0, &mut a, &mut b, m, n, &constraints,
                  &mut partial_ac, &mut a_sum, &mut b_sum,
                  &mut a_alt_sum, &mut b_alt_sum, &alt_sign, st, at,
-                 &mut nodes_visited, max_nodes);
+                 &mut nodes_visited, max_nodes,
+                 use_reversal, ab_symmetric,
+                 &max_contrib_table);
 
     if found {
         (Some((Sequence::new(a), Sequence::new(b))), nodes_visited)
@@ -1839,20 +1875,20 @@ impl Checkpoint {
         }
     }
 
-    fn filename(n: usize) -> String {
-        format!("checkpoint_v6p_n{}.json", n)
+    fn filename_with_suffix(n: usize, suffix: &str) -> String {
+        format!("checkpoint_n44inst_n{}{}.json", n, suffix)
     }
 
-    fn save(&self) -> std::io::Result<()> {
-        let filename = Self::filename(self.n);
+    fn save_with_suffix(&self, suffix: &str) -> std::io::Result<()> {
+        let filename = Self::filename_with_suffix(self.n, suffix);
         let file = File::create(&filename)?;
         let writer = BufWriter::new(file);
         serde_json::to_writer_pretty(writer, self)?;
         Ok(())
     }
 
-    fn load(n: usize) -> Option<Self> {
-        let filename = Self::filename(n);
+    fn load_with_suffix(n: usize, suffix: &str) -> Option<Self> {
+        let filename = Self::filename_with_suffix(n, suffix);
         if !Path::new(&filename).exists() {
             return None;
         }
@@ -1861,8 +1897,8 @@ impl Checkpoint {
         serde_json::from_reader(reader).ok()
     }
 
-    fn delete(n: usize) {
-        let filename = Self::filename(n);
+    fn delete_with_suffix(n: usize, suffix: &str) {
+        let filename = Self::filename_with_suffix(n, suffix);
         let _ = std::fs::remove_file(&filename);
     }
 }
@@ -2341,7 +2377,7 @@ fn run_debug_pipeline(n: usize) {
     {
         let c_seq = Sequence::new(known_c.clone());
         let d_seq = Sequence::new(known_d.clone());
-        let (ab_result, _nodes) = backtrack_search_ab(n, &c_seq, &d_seq, &known_st, &known_at, 10_000_000);
+        let (ab_result, _nodes) = backtrack_search_ab(n, &c_seq.values, &d_seq.values, &known_st, &known_at, 10_000_000);
         match ab_result {
             Some((a, b)) => {
                 println!("  backtrack_search_ab: FOUND");
@@ -2446,7 +2482,7 @@ fn run_pipeline_stats(n: usize) {
                     }
 
                     // Step 5: Try AB backtracking
-                    if let Some((_a, _b)) = backtrack_search_ab(n, c, d, st, at, 10_000_000).0 {
+                    if let Some((_a, _b)) = backtrack_search_ab(n, &c.values, &d.values, st, at, 10_000_000).0 {
                         println!("    >>> SOLUTION FOUND! <<<");
                         found_solution = true;
                     }
@@ -2493,17 +2529,70 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let n: usize = if args.len() > 1 {
         args[1].parse().unwrap_or_else(|_| {
-            eprintln!("Usage: {} <n> [--resume] [--exhaustive]", args[0]);
+            eprintln!("Usage: {} <n> [--instance X/Y] [--ab-limit N|unlimited] [--resume]", args[0]);
             std::process::exit(1);
         })
     } else {
-        eprintln!("Usage: {} <n> [--resume]", args[0]);
+        eprintln!("Usage: {} <n> [--instance X/Y] [--ab-limit N|unlimited] [--resume]", args[0]);
         std::process::exit(1);
     };
 
     let resume = args.iter().any(|a| a == "--resume");
     let debug_pipeline = args.iter().any(|a| a == "--debug-pipeline");
     let pipeline_stats = args.iter().any(|a| a == "--pipeline-stats");
+
+    // Parse --instance X/Y (e.g., --instance 1/3 for first of 3 instances)
+    let instance_spec: Option<(usize, usize)> = args.iter()
+        .position(|a| a == "--instance")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| {
+            let parts: Vec<&str> = s.split('/').collect();
+            if parts.len() == 2 {
+                let inst: usize = parts[0].parse().ok()?;
+                let total: usize = parts[1].parse().ok()?;
+                if inst >= 1 && inst <= total && total >= 1 {
+                    Some((inst, total))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+
+    // Parse --tuple-range START-END (alternative to --instance)
+    let tuple_range: Option<(usize, usize)> = args.iter()
+        .position(|a| a == "--tuple-range")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| {
+            let parts: Vec<&str> = s.split('-').collect();
+            if parts.len() == 2 {
+                Some((parts[0].parse().ok()?, parts[1].parse().ok()?))
+            } else {
+                None
+            }
+        });
+
+    if instance_spec.is_some() && tuple_range.is_some() {
+        eprintln!("Error: --instance and --tuple-range are mutually exclusive");
+        std::process::exit(1);
+    }
+
+    // Parse --ab-limit N or --ab-limit unlimited
+    let backtrack_limit: u64 = args.iter()
+        .position(|a| a == "--ab-limit")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| {
+            if s == "unlimited" || s == "0" {
+                u64::MAX
+            } else {
+                s.parse::<u64>().unwrap_or_else(|_| {
+                    eprintln!("Error: --ab-limit must be a number or 'unlimited'");
+                    std::process::exit(1);
+                })
+            }
+        })
+        .unwrap_or(u64::MAX);
 
     if debug_pipeline {
         run_debug_pipeline(n);
@@ -2515,19 +2604,28 @@ fn main() {
         return;
     }
 
-    println!("BS({},{}) - V6 Parallel Pipeline Search", n + 1, n);
+    let instance_label = instance_spec.map(|(i, t)| format!("[Instance {}/{}] ", i, t)).unwrap_or_default();
+    println!("{}BS({},{}) - N44 Multi-Instance Search", instance_label, n + 1, n);
     println!("==============================================\n");
 
     let num_threads = rayon::current_num_threads();
     println!("Threads: {} (rayon)", num_threads);
 
-    let backtrack_limit: u64 = if n <= 15 { 10_000_000 }
-        else { 50_000_000 };
-
+    let limit_str = if backtrack_limit == u64::MAX {
+        "unlimited".to_string()
+    } else {
+        format!("{}M nodes", backtrack_limit / 1_000_000)
+    };
     println!("Configuration for n={}:", n);
-    println!("  Spectral margin: 0.5");
-    println!("  AB backtrack limit: {:.0e}", backtrack_limit as f64);
+    println!("  Spectral margin: 1e-6");
+    println!("  AB backtrack limit: {}", limit_str);
     println!("  Two-level parallelism: tuples x mod-3 solutions (nested rayon)");
+    if let Some((inst, total)) = instance_spec {
+        println!("  Instance: {}/{}", inst, total);
+    }
+    if let Some((start, end)) = tuple_range {
+        println!("  Tuple range: {}-{}", start, end);
+    }
     println!();
 
     println!("Step 1: Find valid tuples...");
@@ -2554,9 +2652,40 @@ fn main() {
     println!("  Total CD pairs: {:.2e}", total_cd_pairs as f64);
     println!();
 
+    // Convert --instance to tuple range now that we know the tuple count
+    let num_tuples = sorted.len();
+    let effective_range: Option<(usize, usize)> = if let Some((inst, total)) = instance_spec {
+        let chunk = (num_tuples + total - 1) / total; // ceil division
+        let start = (inst - 1) * chunk;
+        let end = (inst * chunk).min(num_tuples);
+        println!("Instance commands ({} tuples, {} instances):", num_tuples, total);
+        for i in 1..=total {
+            let s = (i - 1) * chunk;
+            let e = (i * chunk).min(num_tuples);
+            let marker = if i == inst { " <-- this instance" } else { "" };
+            println!("  Instance {}/{}: ./find_bs_n44_13_instances {} --instance {}/{}   (tuples {}-{}){}",
+                i, total, n, i, total, s, e - 1, marker);
+        }
+        println!();
+        Some((start, end))
+    } else if let Some((s, e)) = tuple_range {
+        Some((s, e.min(num_tuples)))
+    } else {
+        None
+    };
+
+    // Checkpoint identifier for filename
+    let checkpoint_suffix = if let Some((inst, total)) = instance_spec {
+        format!("_{}of{}", inst, total)
+    } else if let Some((s, e)) = effective_range {
+        format!("_r{}-{}", s, e)
+    } else {
+        String::new()
+    };
+
     // Load or create checkpoint
     let checkpoint = if resume {
-        if let Some(cp) = Checkpoint::load(n) {
+        if let Some(cp) = Checkpoint::load_with_suffix(n, &checkpoint_suffix) {
             if cp.version >= 2 {
                 println!("Resuming from checkpoint (v{}):", cp.version);
                 println!("  Completed tuples: {}/{}", cp.completed_tuples.len(), sorted.len());
@@ -2566,7 +2695,7 @@ fn main() {
                 cp
             } else {
                 println!("Found old-format checkpoint (v1 deterministic). Cannot resume.");
-                println!("Starting fresh with randomized sampling.\n");
+                println!("Starting fresh.\n");
                 Checkpoint::new(n)
             }
         } else {
@@ -2589,14 +2718,14 @@ fn main() {
     let cd_tried = Arc::new(AtomicU64::new(checkpoint.total_cd_tried));
     let cd_total = Arc::new(AtomicU64::new(checkpoint.total_cd_tried + checkpoint.total_cd_filtered));
 
+    let ab_timeouts = Arc::new(AtomicU64::new(0));
     let checkpoint_mutex = Arc::new(Mutex::new(checkpoint));
     let sorted_arc = Arc::new(sorted);
+    let checkpoint_suffix = Arc::new(checkpoint_suffix);
 
     // Mod-3/mod-6 counters (needed by both progress thread and search)
     let total_mod3_found = Arc::new(AtomicU64::new(0));
     let total_mod6_found = Arc::new(AtomicU64::new(0));
-    let cd_headroom_skip = Arc::new(AtomicU64::new(0));
-
     // Signal for progress thread termination
     let search_done = Arc::new(AtomicBool::new(false));
 
@@ -2607,9 +2736,10 @@ fn main() {
     let active_clone = Arc::clone(&tuples_active);
     let cd_clone = Arc::clone(&cd_tried);
     let cd_total_clone = Arc::clone(&cd_total);
+    let ab_timeouts_clone = Arc::clone(&ab_timeouts);
     let checkpoint_clone = Arc::clone(&checkpoint_mutex);
-    let headroom_skip_clone = Arc::clone(&cd_headroom_skip);
-    let total_tuples = sorted_arc.len();
+    let checkpoint_suffix_clone = Arc::clone(&checkpoint_suffix);
+    let total_tuples = effective_range.map(|(s, e)| e - s).unwrap_or(sorted_arc.len());
     let start_clone = start.clone();
 
     std::thread::spawn(move || {
@@ -2637,16 +2767,18 @@ fn main() {
             last_tried = tried;
             last_time = Instant::now();
 
-            let hr_skip = headroom_skip_clone.load(Ordering::Relaxed);
-            let ab_attempted = tried - hr_skip;
-            println!("  [{:>4}/{:>4} +{}] | {:.2e} pass / {:.2e} checked ({:.1}%) | AB:{:.2e} hr_skip:{:.2e} | {:.1}/s | {:.1}h",
+            let timeouts = ab_timeouts_clone.load(Ordering::Relaxed);
+            let timeout_rate = if tried > 0 {
+                timeouts as f64 / tried as f64 * 100.0
+            } else { 0.0 };
+
+            println!("  [{:>4}/{:>4} +{}] | {:.2e} pass / {:.2e} checked ({:.1}%) | {:.1}/s | {:.1}% tmout | {:.1}h",
                 done, total_tuples, active,
                 tried as f64,
                 total as f64,
                 pass_rate,
-                ab_attempted as f64,
-                hr_skip as f64,
                 cd_per_sec,
+                timeout_rate,
                 elapsed / 3600.0);
 
             // Save checkpoint periodically (every 5 minutes)
@@ -2655,7 +2787,7 @@ fn main() {
                     cp.total_cd_tried = tried;
                     cp.total_cd_filtered = total - tried;
                     cp.elapsed_secs = elapsed;
-                    if let Err(err) = cp.save() {
+                    if let Err(err) = cp.save_with_suffix(&checkpoint_suffix_clone) {
                         eprintln!("  Warning: Failed to save checkpoint: {}", err);
                     } else {
                         println!("  [Checkpoint saved]");
@@ -2677,9 +2809,13 @@ fn main() {
 
     println!("Step 4: Paper pipeline (Steps 2-5: mod-3 -> mod-6 -> CD+spectral -> AB)\n");
 
-    let result: Option<(BaseSequence, usize, SumTuple, AltSumTuple)> = (0..sorted_arc.len())
+    let range_start = effective_range.map(|(s, _)| s).unwrap_or(0);
+    let range_end = effective_range.map(|(_, e)| e).unwrap_or(sorted_arc.len());
+
+    let checkpoint_suffix_search = Arc::clone(&checkpoint_suffix);
+    let result: Option<(BaseSequence, usize, SumTuple, AltSumTuple)> = (range_start..range_end)
         .into_par_iter()
-        .find_map_any(|tuple_idx| {
+        .find_map_first(|tuple_idx| {
             if found.load(Ordering::Relaxed) { return None; }
             if completed_set.contains(&tuple_idx) { return None; }
 
@@ -2692,7 +2828,7 @@ fn main() {
 
             // INNER PARALLELISM: parallel over mod-3 solutions
             // Rayon work-stealing distributes these across idle threads
-            let result = mod3_sols.into_par_iter().enumerate().find_map_any(|(m3_idx, mod3_sol)| {
+            let result = mod3_sols.into_par_iter().enumerate().find_map_first(|(m3_idx, mod3_sol)| {
                 if found.load(Ordering::Relaxed) { return None; }
                 let mut local_result: Option<(BaseSequence, usize, SumTuple, AltSumTuple)> = None;
 
@@ -2702,27 +2838,21 @@ fn main() {
                     total_mod6_found.fetch_add(1, Ordering::Relaxed);
 
                     // Step 4: CD generation + spectral filter (streaming)
-                    backtrack_cd_from_mod6(n, mod6_sol, 0.5, &mut |c, d| {
+                    backtrack_cd_from_mod6(n, mod6_sol, 1e-6, &mut |c, d| {
                         if found.load(Ordering::Relaxed) { return false; }
 
                         cd_tried.fetch_add(1, Ordering::Relaxed);
 
-                        // AB headroom pre-filter: skip CDs that leave too little
-                        // spectral room for A,B (they'd need |A(z)|²+|B(z)|² < threshold)
-                        if n > 20 {
-                            let headroom = compute_ab_headroom(c, d);
-                            if headroom < 1.0 {
-                                cd_headroom_skip.fetch_add(1, Ordering::Relaxed);
-                                return true; // skip this CD, continue to next
-                            }
-                        }
-
                         // Step 5: Backtracking A,B search (Theorem 2.2)
-                        if let Some((a, b)) = backtrack_search_ab(n, c, d, st, at, backtrack_limit).0 {
-                            let base = BaseSequence::new(a, b, c.clone(), d.clone());
+                        let (ab_result, nodes) = backtrack_search_ab(n, c, d, st, at, backtrack_limit);
+                        if nodes >= backtrack_limit && backtrack_limit != u64::MAX {
+                            ab_timeouts.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if let Some((a, b)) = ab_result {
+                            let base = BaseSequence::new(a, b, Sequence::new(c.to_vec()), Sequence::new(d.to_vec()));
                             if base.is_valid() {
                                 found.store(true, Ordering::Relaxed);
-                                Checkpoint::delete(n);
+                                Checkpoint::delete_with_suffix(n, &checkpoint_suffix_search);
                                 local_result = Some((base, tuple_idx, st.clone(), at.clone()));
                                 return false; // stop
                             }
@@ -2761,23 +2891,35 @@ fn main() {
 
     if let Some((base, idx, st, at)) = result {
         print_solution(n, &base, &st, &at, idx, elapsed_secs,
-            &tuples_done, &cd_tried);
+            &tuples_done, &cd_tried, instance_spec);
     } else if !found.load(Ordering::Relaxed) {
         println!("============================================");
         println!("     Search complete - no solution          ");
         println!("============================================\n");
 
         println!("Time: {:.2} hours", elapsed_secs / 3600.0);
-        println!("Tuples processed: {}/{}", tuples_done.load(Ordering::Relaxed), sorted_arc.len());
+        if let Some((inst, total)) = instance_spec {
+            println!("Instance: {}/{}", inst, total);
+        }
+        println!("Tuples processed: {}/{}", tuples_done.load(Ordering::Relaxed), total_tuples);
         println!("Mod-3 solutions found: {}", total_mod3);
         println!("Mod-6 CD solutions found: {}", total_mod6);
         let tried = cd_tried.load(Ordering::Relaxed);
         let total_checked = cd_total.load(Ordering::Relaxed);
+        let timeouts = ab_timeouts.load(Ordering::Relaxed);
         let pass_rate = if total_checked > 0 { tried as f64 / total_checked as f64 * 100.0 } else { 0.0 };
+        let timeout_rate = if tried > 0 { timeouts as f64 / tried as f64 * 100.0 } else { 0.0 };
         println!("CD pairs checked: {:.2e} ({:.1}% passed spectral)", total_checked as f64, pass_rate);
         println!("CD pairs searched (passed spectral): {:.2e}", tried as f64);
-        println!("\nNote: The paper's algorithm is deterministic. If no solution found,");
-        println!("all CD pairs from the mod-6 decomposition have been exhaustively searched.");
+        println!("AB timeouts: {} ({:.1}% of searched)", timeouts, timeout_rate);
+        if backtrack_limit == u64::MAX {
+            println!("\nNote: Unlimited AB backtracking. If no solution found,");
+            println!("all CD pairs have been exhaustively searched.");
+        } else {
+            println!("\nNote: AB backtrack limit was {}M nodes. {} CD pairs timed out.",
+                backtrack_limit / 1_000_000, timeouts);
+            println!("Re-run with --ab-limit unlimited to exhaustively search timed-out pairs.");
+        }
     }
 }
 
@@ -2790,12 +2932,16 @@ fn print_solution(
     elapsed_secs: f64,
     tuples_done: &AtomicUsize,
     cd_tried: &AtomicU64,
+    instance_spec: Option<(usize, usize)>,
 ) {
     println!("============================================");
     println!("       SUCCESS! BS({},{}) FOUND          ", n + 1, n);
     println!("============================================\n");
 
     println!("Time: {:.2} hours", elapsed_secs / 3600.0);
+    if let Some((inst, total)) = instance_spec {
+        println!("Found by instance {}/{}", inst, total);
+    }
     println!("Tuples checked: {}", tuples_done.load(Ordering::Relaxed));
     println!("CD pairs tried: {:.2e}", cd_tried.load(Ordering::Relaxed) as f64);
     println!();
@@ -2826,11 +2972,15 @@ fn print_solution(
     }
 
     // Save
-    let filename = format!("BS_{}_{}_V6P_{:.0}s.txt", n + 1, n, elapsed_secs);
+    let inst_str = instance_spec.map(|(i, t)| format!("_inst{}of{}", i, t)).unwrap_or_default();
+    let filename = format!("BS_{}_{}_N44{}_{:.0}s.txt", n + 1, n, inst_str, elapsed_secs);
     if let Ok(mut f) = File::create(&filename) {
-        writeln!(f, "BS({},{}) Solution - V6 Aggressive", n + 1, n).ok();
+        writeln!(f, "BS({},{}) Solution - N44 Multi-Instance", n + 1, n).ok();
         writeln!(f, "====================================").ok();
         writeln!(f, "Time: {:.1}s ({:.2}h)", elapsed_secs, elapsed_secs / 3600.0).ok();
+        if let Some((inst, total)) = instance_spec {
+            writeln!(f, "Instance: {}/{}", inst, total).ok();
+        }
         writeln!(f, "CD pairs tried: {:.2e}", cd_tried.load(Ordering::Relaxed) as f64).ok();
         writeln!(f, "").ok();
         writeln!(f, "A = {:?}", base.a.values).ok();

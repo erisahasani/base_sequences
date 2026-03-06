@@ -35,3 +35,7 @@ path = "rust_code/find_bs_v6_evolve1.rs"
 [[bin]]
 name = "find_bs_v6_parallel"
 path = "rust_code/find_bs_v6_parallel.rs"
+
+[[bin]]
+name = "find_bs_n44_13_instances"
+path = "rust_code/find_bs_n44_13_instances.rs"
