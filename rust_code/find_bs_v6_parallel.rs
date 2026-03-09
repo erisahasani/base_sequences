@@ -1,6 +1,6 @@
 
-/// BS(n+1, n) search - N44 Multi-Instance Implementation
-/// Optimized for large n (n=44+) across multiple EC2 instances
+/// BS(n+1, n) search - V6 Parallel Implementation
+/// Optimized for large n with ready-shift pre-filtering
 /// Two-level parallelism: tuples × mod-3 solutions (optimized for 192+ cores)
 ///
 /// Usage: cargo run --release --bin find_bs_n44_13_instances -- <n> --instance X/Y
@@ -1401,6 +1401,7 @@ fn backtrack_cd_from_mod6(
 /// Backtracking search for A,B sequences using Theorem 2.2 constraints.
 /// Uses incremental autocorrelation tracking: O(n) per node instead of O(n²).
 /// Positions filled outside-in; after pair k, shift n-k becomes fully determined.
+/// Enhanced with parity pruning, next-shift pre-check, and cross-term look-ahead.
 
 fn backtrack_search_ab(
     n: usize,
@@ -1416,13 +1417,15 @@ fn backtrack_search_ab(
     let cd_autocorr = {
         let mut v = vec![0i32; n + 1];
         for shift in 1..=n {
-            let cn = c.len();
-            let mut sc = 0i32;
-            for j in 0..(cn - shift) { sc += c[j] * c[j + shift]; }
-            let dn = d.len();
-            let mut sd = 0i32;
-            for j in 0..(dn - shift) { sd += d[j] * d[j + shift]; }
-            v[shift] = sc + sd;
+            let mut ac_c = 0i32;
+            let mut ac_d = 0i32;
+            for i in 0..c.len() - shift {
+                ac_c += c[i] * c[i + shift];
+            }
+            for i in 0..d.len() - shift {
+                ac_d += d[i] * d[i + shift];
+            }
+            v[shift] = ac_c + ac_d;
         }
         v
     };
@@ -1475,7 +1478,6 @@ fn backtrack_search_ab(
 
     // Symmetry breaking flags for AB backtracking (depth 0 only)
     // Reversal: reverse(A), reverse(B) is a same-tuple symmetry only when n is even
-    // (alt_sum(reverse(X)) = (-1)^{m-1} * alt_sum(X), and m-1=n is even iff n is even)
     let use_reversal = n % 2 == 0;
     // A<->B swap: swapping A,B gives same tuple only when sum and alt-sum match
     let ab_symmetric = st.a == st.b && at.a_star == at.b_star;
@@ -1591,6 +1593,36 @@ fn backtrack_search_ab(
 
         let required_delta = -partial_ac[ready_shift];
 
+        // Precompute next-shift pre-check coefficients (O(1) per depth)
+        // This checks shift ready_shift-1 BEFORE the expensive O(n) update.
+        let ns = ready_shift.wrapping_sub(1); // next shift to check
+        let do_ns_check = ns >= 1 && !is_middle && remaining_positions > 0;
+        let mut ns_cl_a = 0i32;
+        let mut ns_cl_b = 0i32;
+        let mut ns_cr_a = 0i32;
+        let mut ns_cr_b = 0i32;
+        let mut ns_has_cross = false;
+        let ns_mc = if do_ns_check { max_contrib_table[pair_idx][ns] } else { 0 };
+        if do_ns_check {
+            if pos_left >= ns && a[pos_left - ns] != 0 {
+                ns_cl_a += a[pos_left - ns];
+                ns_cl_b += b[pos_left - ns];
+            }
+            if pos_left + ns < m && pos_left + ns != pos_right && a[pos_left + ns] != 0 {
+                ns_cl_a += a[pos_left + ns];
+                ns_cl_b += b[pos_left + ns];
+            }
+            if pos_right >= ns && pos_right - ns != pos_left && a[pos_right - ns] != 0 {
+                ns_cr_a += a[pos_right - ns];
+                ns_cr_b += b[pos_right - ns];
+            }
+            if pos_right + ns < m && a[pos_right + ns] != 0 {
+                ns_cr_a += a[pos_right + ns];
+                ns_cr_b += b[pos_right + ns];
+            }
+            ns_has_cross = pos_right - pos_left == ns;
+        }
+
         for &(a_i, b_i, a_j, b_j) in &constraints[pair_idx] {
             *nodes_visited += 1;
             if *nodes_visited >= max_nodes { return false; }
@@ -1643,7 +1675,18 @@ fn backtrack_search_ab(
                 { continue; }
             }
 
-            // 3. Update: O(n-pair_idx) — only reached by options passing both filters
+            // 2b. Next-shift pre-check: O(1), avoids expensive O(n) update for doomed options
+            //     Check if shift ready_shift-1 is still achievable after this placement.
+            if do_ns_check {
+                let ns_delta = a_i * ns_cl_a + b_i * ns_cl_b + a_j * ns_cr_a + b_j * ns_cr_b
+                    + if ns_has_cross { a_i * a_j + b_i * b_j } else { 0 };
+                let new_pac = (partial_ac[ns] + ns_delta).abs();
+                if new_pac > ns_mc || (new_pac & 1) != (ns_mc & 1) {
+                    continue;
+                }
+            }
+
+            // 3. Update: O(n-pair_idx) — only reached by options passing all pre-checks
             if is_middle {
                 a[pos_left] = a_i;
                 b[pos_left] = b_i;
@@ -1665,11 +1708,14 @@ fn backtrack_search_ab(
                 *b_alt_sum += db_alt;
             }
 
-            // 4. Tight bound check (ready_shift guaranteed 0 by pre-filter)
+            // 4. Tight bound check with parity pruning (ready_shift guaranteed 0 by pre-filter)
             let mut shift_ok = true;
             if remaining_positions > 0 {
                 for s in (1..ready_shift).rev() {
-                    if partial_ac[s].abs() > max_contrib_table[pair_idx][s] {
+                    let pac = partial_ac[s];
+                    let max_c = max_contrib_table[pair_idx][s];
+                    let apac = pac.abs();
+                    if apac > max_c || (apac & 1) != (max_c & 1) {
                         shift_ok = false;
                         break;
                     }
@@ -1677,6 +1723,7 @@ fn backtrack_search_ab(
             }
 
             // 5. Exact look-ahead: can ANY next-depth option zero next ready shift?
+            //    Also check sum/alt-sum feasibility for next-depth options.
             if shift_ok && pair_idx + 1 < num_pairs {
                 let next_ready = ready_shift - 1;
                 if next_ready >= 1 {
@@ -1695,11 +1742,21 @@ fn backtrack_search_ab(
                         nlb += b[next_left + next_ready];
                     }
 
-                    if next_left == next_right {
+                    let next_is_middle = next_left == next_right;
+                    let next_remaining = if next_is_middle { 0 } else { m - 2 * (pair_idx + 2) };
+                    let next_rp = next_remaining as i32;
+
+                    if next_is_middle {
                         let mut any_ok = false;
-                        for &ai in &[-1i32, 1] {
-                            for &bi in &[-1i32, 1] {
-                                if ai * nla + bi * nlb == req { any_ok = true; break; }
+                        for &nai in &[-1i32, 1] {
+                            for &nbi in &[-1i32, 1] {
+                                if nai * nla + nbi * nlb != req { continue; }
+                                // Sum check at middle
+                                if *a_sum + nai != st.a || *b_sum + nbi != st.b { continue; }
+                                let da = alt_sign[next_left] * nai;
+                                let db = alt_sign[next_left] * nbi;
+                                if *a_alt_sum + da != at.a_star || *b_alt_sum + db != at.b_star { continue; }
+                                any_ok = true; break;
                             }
                             if any_ok { break; }
                         }
@@ -1715,12 +1772,28 @@ fn backtrack_search_ab(
                             nra += a[next_right + next_ready];
                             nrb += b[next_right + next_ready];
                         }
+
+                        let has_next_cross = (next_right >= next_ready && next_right - next_ready == next_left)
+                            || (next_right + next_ready < m && next_right + next_ready == next_left);
+
                         let mut any_ok = false;
                         for &(nai, nbi, naj, nbj) in &constraints[pair_idx + 1] {
-                            if nai * nla + nbi * nlb + naj * nra + nbj * nrb == req {
-                                any_ok = true;
-                                break;
-                            }
+                            let d = nai * nla + nbi * nlb + naj * nra + nbj * nrb
+                                + if has_next_cross { nai * naj + nbi * nbj } else { 0 };
+                            if d != req { continue; }
+                            // Sum/alt-sum feasibility
+                            let ar = st.a - *a_sum - nai - naj;
+                            let br = st.b - *b_sum - nbi - nbj;
+                            if ar.abs() > next_rp || br.abs() > next_rp
+                                || (ar + next_rp) % 2 != 0 || (br + next_rp) % 2 != 0 { continue; }
+                            let da = alt_sign[next_left] * nai + alt_sign[next_right] * naj;
+                            let db = alt_sign[next_left] * nbi + alt_sign[next_right] * nbj;
+                            let aar = at.a_star - *a_alt_sum - da;
+                            let bar = at.b_star - *b_alt_sum - db;
+                            if aar.abs() > next_rp || bar.abs() > next_rp
+                                || (aar + next_rp) % 2 != 0 || (bar + next_rp) % 2 != 0 { continue; }
+                            any_ok = true;
+                            break;
                         }
                         if !any_ok { shift_ok = false; }
                     }
@@ -1777,11 +1850,6 @@ fn backtrack_search_ab(
         (None, nodes_visited)
     }
 }
-
-
-
-
-
 
 // ============================================================================
 // Shared: precompute_binomials (used by both cd_optimized and exhaustive_ab)
@@ -2605,7 +2673,7 @@ fn main() {
     }
 
     let instance_label = instance_spec.map(|(i, t)| format!("[Instance {}/{}] ", i, t)).unwrap_or_default();
-    println!("{}BS({},{}) - N44 Multi-Instance Search", instance_label, n + 1, n);
+    println!("{}BS({},{}) - V6 Parallel Search", instance_label, n + 1, n);
     println!("==============================================\n");
 
     let num_threads = rayon::current_num_threads();
@@ -2973,9 +3041,9 @@ fn print_solution(
 
     // Save
     let inst_str = instance_spec.map(|(i, t)| format!("_inst{}of{}", i, t)).unwrap_or_default();
-    let filename = format!("BS_{}_{}_N44{}_{:.0}s.txt", n + 1, n, inst_str, elapsed_secs);
+    let filename = format!("BS_{}_{}_V6Parallel{}_{:.0}s.txt", n + 1, n, inst_str, elapsed_secs);
     if let Ok(mut f) = File::create(&filename) {
-        writeln!(f, "BS({},{}) Solution - N44 Multi-Instance", n + 1, n).ok();
+        writeln!(f, "BS({},{}) Solution - V6 Parallel", n + 1, n).ok();
         writeln!(f, "====================================").ok();
         writeln!(f, "Time: {:.1}s ({:.2}h)", elapsed_secs, elapsed_secs / 3600.0).ok();
         if let Some((inst, total)) = instance_spec {
