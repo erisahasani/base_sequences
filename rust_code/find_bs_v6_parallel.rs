@@ -1139,6 +1139,194 @@ fn check_mod6_ab_feasible(
     false
 }
 
+/// Enumerate ALL valid mod-6 AB partial sum solutions (k6, r6) given the mod-3 AB
+/// partial sums from `mod3_sol` and the known CD mod-6 partials `p6`/`q6`.
+/// Returns Vec of ([k6;6], [r6;6]) pairs that satisfy:
+///   - Refinement of mod-3 sums
+///   - Sum-of-squares budget (k² + r² = target - p² - q²)
+///   - Orthogonality at m=6 (N_K(s)+N_R(s)+N_P(s)+N_Q(s)=0 for s=1..3 and 6-s)
+///   - Eq 2.12 mod-4 constraints for AB
+fn enumerate_mod6_ab_solutions(
+    n: usize,
+    st: &SumTuple,
+    at: &AltSumTuple,
+    p6: &[i32; 6],
+    q6: &[i32; 6],
+) -> Vec<([i32; 6], [i32; 6])> {
+    let mut results = Vec::new();
+    let m: usize = 6;
+    let m_ab = n + 1;
+
+    let target_sq = (4 * n + 2) as i32;
+    let pq_sq: i32 = p6.iter().chain(q6.iter()).map(|x| x * x).sum();
+    if pq_sq > target_sq { return results; }
+    let kr_sq_budget = target_sq - pq_sq;
+
+    let mut k_bounds = [(0i32, 0i32, 0i32); 6];
+    let mut r_bounds = [(0i32, 0i32, 0i32); 6];
+    for i in 1..=6 {
+        k_bounds[i - 1] = partial_sum_bound(m_ab, i, m);
+        r_bounds[i - 1] = partial_sum_bound(m_ab, i, m);
+    }
+
+    // Derive per-tuple even/odd sum constraints for k6:
+    //   k6[0]+k6[2]+k6[4] = (st.a + at.a_star) / 2   (a[j] at even positions j)
+    //   k6[1]+k6[3]+k6[5] = (st.a - at.a_star) / 2   (a[j] at odd positions j)
+    // These are correct for ALL mod3_sols and all (c,d) pairs under this tuple.
+    // Using mod3_sol.k here was the original bug: the same (c,d) can be reached from
+    // multiple mod3_sols (with different k3/r3), so constraining to one mod3_sol's k3
+    // falsely pruned AB paths found under the correct mod3_sol.
+    let k_sum_a_plus = st.a + at.a_star;
+    let k_sum_a_minus = st.a - at.a_star;
+    if k_sum_a_plus % 2 != 0 || k_sum_a_minus % 2 != 0 { return results; }
+    let k_even_sum = k_sum_a_plus / 2;   // k6[0]+k6[2]+k6[4]
+    let k_odd_sum  = k_sum_a_minus / 2;  // k6[1]+k6[3]+k6[5]
+
+    let r_sum_b_plus = st.b + at.b_star;
+    let r_sum_b_minus = st.b - at.b_star;
+    if r_sum_b_plus % 2 != 0 || r_sum_b_minus % 2 != 0 { return results; }
+    let r_even_sum = r_sum_b_plus / 2;
+    let r_odd_sum  = r_sum_b_minus / 2;
+
+    // Enumerate k6 as two independent groups:
+    //   Even group: k6[0], k6[2] free, k6[4] = k_even_sum - k6[0] - k6[2]
+    //   Odd  group: k6[1], k6[3] free, k6[5] = k_odd_sum  - k6[1] - k6[3]
+    // This has the same O(bound²) cost as the former mod3 approach.
+    let (lo0, hi0, par0) = k_bounds[0];
+    let (lo2, hi2, par2) = k_bounds[2];
+    let (lo4, hi4, par4) = k_bounds[4];
+    let (lo1, hi1, par1) = k_bounds[1];
+    let (lo3, hi3, par3) = k_bounds[3];
+    let (lo5, hi5, par5) = k_bounds[5];
+
+    let mut k_candidates: Vec<[i32; 6]> = Vec::new();
+    {
+        let mut k0 = lo0 + ((par0 - ((lo0 % 2 + 2) % 2)) % 2 + 2) % 2;
+        while k0 <= hi0 {
+            let sq0 = k0 * k0;
+            if sq0 > kr_sq_budget { k0 += 2; continue; }
+            let mut k2 = lo2 + ((par2 - ((lo2 % 2 + 2) % 2)) % 2 + 2) % 2;
+            while k2 <= hi2 {
+                let sq02 = sq0 + k2 * k2;
+                if sq02 > kr_sq_budget { k2 += 2; continue; }
+                let k4 = k_even_sum - k0 - k2;
+                if k4 < lo4 || k4 > hi4 || ((k4 % 2 + 2) % 2) != par4 { k2 += 2; continue; }
+                let sq024 = sq02 + k4 * k4;
+                if sq024 > kr_sq_budget { k2 += 2; continue; }
+                // Odd group
+                let mut k1 = lo1 + ((par1 - ((lo1 % 2 + 2) % 2)) % 2 + 2) % 2;
+                while k1 <= hi1 {
+                    let sq0241 = sq024 + k1 * k1;
+                    if sq0241 > kr_sq_budget { k1 += 2; continue; }
+                    let mut k3 = lo3 + ((par3 - ((lo3 % 2 + 2) % 2)) % 2 + 2) % 2;
+                    while k3 <= hi3 {
+                        let k5 = k_odd_sum - k1 - k3;
+                        if k5 < lo5 || k5 > hi5 || ((k5 % 2 + 2) % 2) != par5 { k3 += 2; continue; }
+                        let sq_total = sq0241 + k3 * k3 + k5 * k5;
+                        if sq_total <= kr_sq_budget {
+                            k_candidates.push([k0, k1, k2, k3, k4, k5]);
+                        }
+                        k3 += 2;
+                    }
+                    k1 += 2;
+                }
+                k2 += 2;
+            }
+            k0 += 2;
+        }
+    }
+    if k_candidates.is_empty() { return results; }
+
+    let overlap_j = if (n + 1) % m == 0 { m } else { (n + 1) % m };
+    let ab_pair1_target = if n % m != 0 { 2i32 } else { 0i32 };
+
+    // Precompute r_bounds for the odd/even sum enumeration
+    let (rlo0, rhi0, rpar0) = r_bounds[0];
+    let (rlo2, rhi2, rpar2) = r_bounds[2];
+    let (rlo4, rhi4, rpar4) = r_bounds[4];
+    let (rlo1, rhi1, rpar1) = r_bounds[1];
+    let (rlo3, rhi3, rpar3) = r_bounds[3];
+    let (rlo5, rhi5, rpar5) = r_bounds[5];
+
+    for k_cand in &k_candidates {
+        let k_sq: i32 = k_cand.iter().map(|x| x * x).sum();
+        let r_sq_budget = kr_sq_budget - k_sq;
+        if r_sq_budget < 0 { continue; }
+
+        // Enumerate r6 using even/odd sum constraints, same structure as k6
+        let mut r_candidates: Vec<[i32; 6]> = Vec::new();
+        {
+            let mut r0 = rlo0 + ((rpar0 - ((rlo0 % 2 + 2) % 2)) % 2 + 2) % 2;
+            while r0 <= rhi0 {
+                let sq0 = r0 * r0;
+                if sq0 > r_sq_budget { r0 += 2; continue; }
+                let mut r2 = rlo2 + ((rpar2 - ((rlo2 % 2 + 2) % 2)) % 2 + 2) % 2;
+                while r2 <= rhi2 {
+                    let sq02 = sq0 + r2 * r2;
+                    if sq02 > r_sq_budget { r2 += 2; continue; }
+                    let r4 = r_even_sum - r0 - r2;
+                    if r4 < rlo4 || r4 > rhi4 || ((r4 % 2 + 2) % 2) != rpar4 { r2 += 2; continue; }
+                    let sq024 = sq02 + r4 * r4;
+                    if sq024 > r_sq_budget { r2 += 2; continue; }
+                    let mut r1 = rlo1 + ((rpar1 - ((rlo1 % 2 + 2) % 2)) % 2 + 2) % 2;
+                    while r1 <= rhi1 {
+                        let sq0241 = sq024 + r1 * r1;
+                        if sq0241 > r_sq_budget { r1 += 2; continue; }
+                        let mut r3 = rlo3 + ((rpar3 - ((rlo3 % 2 + 2) % 2)) % 2 + 2) % 2;
+                        while r3 <= rhi3 {
+                            let r5 = r_odd_sum - r1 - r3;
+                            if r5 < rlo5 || r5 > rhi5 || ((r5 % 2 + 2) % 2) != rpar5 { r3 += 2; continue; }
+                            let sq_total = sq0241 + r3 * r3 + r5 * r5;
+                            if sq_total <= r_sq_budget {
+                                r_candidates.push([r0, r1, r2, r3, r4, r5]);
+                            }
+                            r3 += 2;
+                        }
+                        r1 += 2;
+                    }
+                    r2 += 2;
+                }
+                r0 += 2;
+            }
+        }
+
+        for r_cand in &r_candidates {
+            // Sum-of-squares exact check
+            let total_sq: i32 = k_sq + r_cand.iter().map(|x| x * x).sum::<i32>() + pq_sq;
+            if total_sq != target_sq { continue; }
+
+            // Orthogonality at m=6: for s=1,2,3 check N_K(s)+N_R(s)+N_P(s)+N_Q(s)
+            //                                          + N_K(6-s)+N_R(6-s)+N_P(6-s)+N_Q(6-s) = 0
+            let mut ortho_ok = true;
+            for s in 1..=3usize {
+                let ortho = partial_autocorr(k_cand, s) + partial_autocorr(r_cand, s)
+                    + partial_autocorr(p6, s) + partial_autocorr(q6, s)
+                    + partial_autocorr(k_cand, m - s) + partial_autocorr(r_cand, m - s)
+                    + partial_autocorr(p6, m - s) + partial_autocorr(q6, m - s);
+                if ortho != 0 { ortho_ok = false; break; }
+            }
+            if !ortho_ok { continue; }
+
+            // Eq 2.12 mod-4 for AB at m=6
+            let res_n1 = if (n + 1) % m == 0 { m } else { (n + 1) % m };
+            let sum1 = k_cand[0] + r_cand[0] + k_cand[res_n1 - 1] + r_cand[res_n1 - 1];
+            if ((sum1 % 4) + 4) % 4 != ((ab_pair1_target % 4) + 4) % 4 { continue; }
+
+            let mut mod4_ok = true;
+            for j in 2..=m {
+                if j == overlap_j { continue; }
+                let res_pair = if (n + 2 - j) % m == 0 { m } else { (n + 2 - j) % m };
+                let sum_j = k_cand[j-1] + r_cand[j-1] + k_cand[res_pair-1] + r_cand[res_pair-1];
+                if ((sum_j % 4) + 4) % 4 != 0 { mod4_ok = false; break; }
+            }
+            if !mod4_ok { continue; }
+
+            results.push((*k_cand, *r_cand));
+        }
+    }
+    results
+}
+
 /// Deterministic backtracking to construct C,D sequences satisfying both
 /// Theorem 2.2 paired constraints AND target mod-6 partial sums.
 /// Integrates spectral filtering: maintains Hall polynomial incrementally,
@@ -1579,7 +1767,7 @@ fn backtrack_search_ab_simple(
             2 * (both_unfilled + left_count + right_count)
         }).collect()
     }).collect();
-    backtrack_search_ab(n, c, d, st, at, max_nodes, &constraints, &max_contrib)
+    backtrack_search_ab(n, c, d, st, at, max_nodes, &constraints, &max_contrib, &[])
 }
 
 fn backtrack_search_ab(
@@ -1591,6 +1779,7 @@ fn backtrack_search_ab(
     max_nodes: u64,
     cached_constraints: &[Vec<(i32, i32, i32, i32)>],
     cached_max_contrib: &[Vec<i32>],
+    ab_mod6_sols: &[([i32; 6], [i32; 6])],
 ) -> (Option<(Sequence, Sequence)>, u64) {
     let m = n + 1;
 
@@ -1603,6 +1792,23 @@ fn backtrack_search_ab(
     let mut a = vec![0i32; m];
     let mut b = vec![0i32; m];
     let mut nodes_visited = 0u64;
+
+    // Feature 3: Mod-6 AB partial-sum feasibility.
+    // mod6_rem[pidx][i] = count of positions j in [pidx, m-1-pidx] with j%6==i.
+    // After filling pair pidx, remaining unfilled range becomes [pidx+1, m-2-pidx],
+    // so we use mod6_rem[pidx+1] for the feasibility check.
+    let mod6_rem: Vec<[i32; 6]> = (0..=m).map(|pidx| {
+        let mut cnt = [0i32; 6];
+        let lo = pidx;
+        let hi = if m >= 1 + pidx { m - 1 - pidx } else { 0 };
+        if hi >= lo {
+            for j in lo..=hi { cnt[j % 6] += 1; }
+        }
+        cnt
+    }).collect();
+    // Running mod-6 partial sums of A and B (updated as pairs are filled)
+    let mut k_run = [0i32; 6];
+    let mut r_run = [0i32; 6];
 
     // Incremental state: partial_ac[s] = N_C(s) + N_D(s) + (AB terms for filled pairs)
     let mut partial_ac = cd_autocorr.clone();
@@ -1699,6 +1905,10 @@ fn backtrack_search_ab(
         use_reversal: bool,
         ab_symmetric: bool,
         max_contrib_table: &[Vec<i32>],
+        k_run: &mut [i32; 6],
+        r_run: &mut [i32; 6],
+        ab_mod6_sols: &[([i32; 6], [i32; 6])],
+        mod6_rem: &[[i32; 6]],
     ) -> bool {
         if *nodes_visited >= max_nodes { return false; }
 
@@ -1849,6 +2059,9 @@ fn backtrack_search_ab(
                 *a_alt_sum += da_alt;
                 *b_alt_sum += db_alt;
                 update_partial_ac(partial_ac, a, b, pos_left, a_i, b_i, n - pair_idx, m);
+                // Feature 3: update mod-6 running sums
+                k_run[pos_left % 6] += a_i;
+                r_run[pos_left % 6] += b_i;
             } else {
                 a[pos_left] = a_i;
                 b[pos_left] = b_i;
@@ -1860,6 +2073,11 @@ fn backtrack_search_ab(
                 *b_sum += b_i + b_j;
                 *a_alt_sum += da_alt;
                 *b_alt_sum += db_alt;
+                // Feature 3: update mod-6 running sums
+                k_run[pos_left % 6] += a_i;
+                k_run[pos_right % 6] += a_j;
+                r_run[pos_left % 6] += b_i;
+                r_run[pos_right % 6] += b_j;
             }
 
             // 4. Tight bound check on ALL shifts (catches failures not covered by 3-shift pre-filter)
@@ -1873,6 +2091,84 @@ fn backtrack_search_ab(
                         break;
                     }
                 }
+                // Sum-of-squares bound: each unfilled position can't fix all shifts
+                // independently — this catches cases where shifts are individually
+                // feasible but can't all be zeroed simultaneously.
+                if shift_ok {
+                    let remaining_energy: i64 = (1..ready_shift)
+                        .map(|s| (partial_ac[s] as i64) * (partial_ac[s] as i64))
+                        .sum();
+                    let max_energy: i64 = (1..ready_shift)
+                        .map(|s| (max_contrib_table[pair_idx][s] as i64) * (max_contrib_table[pair_idx][s] as i64))
+                        .sum();
+                    if remaining_energy > max_energy {
+                        shift_ok = false;
+                    }
+                }
+
+                // Feature 1: Doubly-constrained position tightening.
+                // An unfilled position k with BOTH shift-s neighbors already filled
+                // contributes at most |a[k-s]+a[k+s]| + |b[k-s]+b[k+s]| ≤ 4
+                // to partial_ac[s], instead of the 4 the static table assumes.
+                // We only run this scan for shifts whose headroom is < 4 (meaning
+                // even a single doubly-constrained position saving 4 could cause pruning).
+                if shift_ok {
+                    let uf_lo = pair_idx + 1;
+                    if m >= 2 + pair_idx {
+                        let uf_hi = m - 2 - pair_idx;
+                        if uf_hi >= uf_lo {
+                            for s in (1..ready_shift).rev() {
+                                if !shift_ok { break; }
+                                let pac = partial_ac[s];
+                                if pac == 0 { continue; }
+                                let coarse = max_contrib_table[pair_idx][s];
+                                if coarse - pac.abs() >= 4 { continue; }
+                                let mut tight = coarse;
+                                for k in uf_lo..=uf_hi {
+                                    if k >= s && k + s < m {
+                                        unsafe {
+                                            let al = *a.get_unchecked(k - s);
+                                            if al != 0 {
+                                                let ar = *a.get_unchecked(k + s);
+                                                if ar != 0 {
+                                                    let sa = al + ar;
+                                                    let sb = *b.get_unchecked(k - s)
+                                                           + *b.get_unchecked(k + s);
+                                                    tight += sa.abs() + sb.abs() - 4;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if pac.abs() > tight { shift_ok = false; }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 4b. Feature 3: Mod-6 AB partial-sum feasibility.
+            // After filling pair pair_idx, check that at least one of the pre-enumerated
+            // mod-6 AB solutions (k6, r6) is still achievable given the running sums
+            // k_run/r_run and the remaining unfilled positions per residue class.
+            // For the middle (remaining_positions == 0) the check is exact equality.
+            if shift_ok && !ab_mod6_sols.is_empty() {
+                let next_rem = if pair_idx + 1 <= mod6_rem.len().saturating_sub(1) {
+                    &mod6_rem[pair_idx + 1]
+                } else {
+                    &[0i32; 6]
+                };
+                let feasible = ab_mod6_sols.iter().any(|(k6, r6)| {
+                    for i in 0..6 {
+                        let rem = next_rem[i];
+                        let k_need = k6[i] - k_run[i];
+                        let r_need = r6[i] - r_run[i];
+                        if k_need.abs() > rem || (k_need + rem) % 2 != 0 { return false; }
+                        if r_need.abs() > rem || (r_need + rem) % 2 != 0 { return false; }
+                    }
+                    true
+                });
+                if !feasible { shift_ok = false; }
             }
 
             // 5. V7: Multi-shift look-ahead with arc consistency
@@ -2037,6 +2333,7 @@ fn backtrack_search_ab(
                              nodes_visited, max_nodes,
                              use_reversal, ab_symmetric,
                              max_contrib_table,
+                             k_run, r_run, ab_mod6_sols, mod6_rem,
 ) {
                     return true;
                 }
@@ -2051,6 +2348,9 @@ fn backtrack_search_ab(
                 *b_sum -= b_i;
                 *a_alt_sum -= da_alt;
                 *b_alt_sum -= db_alt;
+                // Feature 3: undo mod-6 running sums
+                k_run[pos_left % 6] -= a_i;
+                r_run[pos_left % 6] -= b_i;
             } else {
                 undo_partial_ac(partial_ac, a, b, pos_right, a_j, b_j, n - pair_idx, m);
                 a[pos_right] = 0;
@@ -2062,6 +2362,11 @@ fn backtrack_search_ab(
                 *b_sum -= b_i + b_j;
                 *a_alt_sum -= da_alt;
                 *b_alt_sum -= db_alt;
+                // Feature 3: undo mod-6 running sums
+                k_run[pos_left % 6] -= a_i;
+                k_run[pos_right % 6] -= a_j;
+                r_run[pos_left % 6] -= b_i;
+                r_run[pos_right % 6] -= b_j;
             }
         }
 
@@ -2073,7 +2378,8 @@ fn backtrack_search_ab(
                  &mut a_alt_sum, &mut b_alt_sum, &alt_sign, st, at,
                  &mut nodes_visited, max_nodes,
                  use_reversal, ab_symmetric,
-                 &max_contrib_table);
+                 &max_contrib_table,
+                 &mut k_run, &mut r_run, ab_mod6_sols, &mod6_rem);
 
     if found {
         (Some((Sequence::new(a), Sequence::new(b))), nodes_visited)
@@ -3192,12 +3498,17 @@ fn main() {
                     if found.load(Ordering::Relaxed) { return false; }
                     total_mod6_found.fetch_add(1, Ordering::Relaxed);
 
+                    // Feature 3: enumerate valid mod-6 AB solutions for this
+                    // (p6, q6) combination. Computed once per mod6_cd_sol and reused
+                    // for every (c, d) pair produced by it.
+                    let ab_mod6_sols = enumerate_mod6_ab_solutions(n, st, at, &mod6_sol.p, &mod6_sol.q);
+
                     backtrack_cd_from_mod6(n, mod6_sol, spectral_margin, &mut |c, d| {
                         if found.load(Ordering::Relaxed) { return false; }
 
                         cd_tried.fetch_add(1, Ordering::Relaxed);
 
-                        let (ab_result, nodes) = backtrack_search_ab(n, c, d, st, at, backtrack_limit, &ab_constraints, &ab_max_contrib);
+                        let (ab_result, nodes) = backtrack_search_ab(n, c, d, st, at, backtrack_limit, &ab_constraints, &ab_max_contrib, &ab_mod6_sols);
                         if nodes >= backtrack_limit && backtrack_limit != u64::MAX {
                             ab_timeouts.fetch_add(1, Ordering::Relaxed);
                         }
