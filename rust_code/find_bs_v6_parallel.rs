@@ -672,9 +672,9 @@ fn collect_mod3_solutions(n: usize, st: &SumTuple, at: &AltSumTuple, max: usize)
     results
 }
 
-fn collect_mod6_cd_solutions(n: usize, mod3_sol: &Mod3Solution, mod3_idx: usize, max: usize) -> Vec<Mod6CDSolution> {
+fn collect_mod6_cd_solutions(n: usize, mod3_sol: &Mod3Solution, mod3_idx: usize, st: &SumTuple, at: &AltSumTuple, max: usize) -> Vec<Mod6CDSolution> {
     let mut results = Vec::new();
-    enumerate_mod6_cd_solutions(n, mod3_sol, mod3_idx, &mut |sol| {
+    enumerate_mod6_cd_solutions(n, mod3_sol, mod3_idx, st, at, &mut |sol| {
         results.push(sol.clone());
         results.len() < max
     });
@@ -890,16 +890,37 @@ fn enumerate_mod6_cd_solutions<F: FnMut(&Mod6CDSolution) -> bool>(
     n: usize,
     mod3_sol: &Mod3Solution,
     mod3_idx: usize,
+    st: &SumTuple,
+    at: &AltSumTuple,
     callback: &mut F,
 ) {
     let m = 6;
     let m_cd = n; // length of C, D
 
-    // The mod-6 CD partials must refine mod-3:
-    // p_{i,3} = p_{i,6} + p_{i+3,6} for i=1,2,3
-    // q_{i,3} = q_{i,6} + q_{i+3,6} for i=1,2,3
+    // The mod-6 CD partials must satisfy BOTH:
+    //   mod-3 refinement: p6[i]+p6[i+3] = p3[i] for i=0,1,2
+    //   even/odd sums:    p6[0]+p6[2]+p6[4] = (st.c + at.c_star)/2
+    //                     p6[1]+p6[3]+p6[5] = (st.c - at.c_star)/2
+    // Together these leave only 2 free parameters (p6[0] and p6[2]), down from 3.
+    //
+    // Derivation (free: p6[0], p6[2]):
+    //   p6[3] = p3[0] - p6[0]
+    //   p6[4] = E_c - p6[0] - p6[2]
+    //   p6[1] = p3[1] - p6[4] = p3[1] - E_c + p6[0] + p6[2]
+    //   p6[5] = p3[2] - p6[2]
+    // where E_c = (st.c + at.c_star) / 2, E_d = (st.d + at.d_star) / 2
 
-    // Compute bounds for each mod-6 residue class of C (length n)
+    let sum_cp = st.c + at.c_star;
+    let sum_cm = st.c - at.c_star;
+    if sum_cp % 2 != 0 || sum_cm % 2 != 0 { return; }
+    let e_c = sum_cp / 2; // p6[0]+p6[2]+p6[4]
+
+    let sum_dp = st.d + at.d_star;
+    let sum_dm = st.d - at.d_star;
+    if sum_dp % 2 != 0 || sum_dm % 2 != 0 { return; }
+    let e_d = sum_dp / 2; // q6[0]+q6[2]+q6[4]
+
+    // Compute bounds for each mod-6 residue class of C and D (length n)
     let mut p_bounds = [(0i32, 0i32, 0i32); 6];
     let mut q_bounds = [(0i32, 0i32, 0i32); 6];
     for i in 1..=6 {
@@ -907,93 +928,90 @@ fn enumerate_mod6_cd_solutions<F: FnMut(&Mod6CDSolution) -> bool>(
         q_bounds[i - 1] = partial_sum_bound(m_cd, i, m);
     }
 
-    // Enumerate p values: for each i=1,2,3, enumerate p_{i,6}, derive p_{i+3,6}
-    // p_{i,6} range: p_bounds[i-1], and p_{i+3,6} = mod3_sol.p[i-1] - p_{i,6}
-    let mut p_candidates: Vec<[i32; 6]> = vec![[0; 6]]; // start with one empty candidate
+    let (plo0, phi0, ppar0) = p_bounds[0];
+    let (plo1, phi1, ppar1) = p_bounds[1];
+    let (plo2, phi2, ppar2) = p_bounds[2];
+    let (plo3, phi3, ppar3) = p_bounds[3];
+    let (plo4, phi4, ppar4) = p_bounds[4];
+    let (plo5, phi5, ppar5) = p_bounds[5];
 
-    for i_mod3 in 0..3 {
-        let target = mod3_sol.p[i_mod3];
-        let (lo_a, hi_a, par_a) = p_bounds[i_mod3];
-        let (lo_b, hi_b, par_b) = p_bounds[i_mod3 + 3];
+    // Enumerate p6: 2 free params (p6[0] and p6[2])
+    let mut p_candidates: Vec<[i32; 6]> = Vec::new();
+    let mut p6_0 = plo0 + ((ppar0 - ((plo0 % 2 + 2) % 2)) % 2 + 2) % 2;
+    while p6_0 <= phi0 {
+        let p6_3 = mod3_sol.p[0] - p6_0;
+        if p6_3 < plo3 || p6_3 > phi3 || ((p6_3 % 2 + 2) % 2) != ppar3 { p6_0 += 2; continue; }
 
-        let mut new_candidates = Vec::new();
-        for cand in &p_candidates {
-            let mut pa = lo_a + ((par_a - ((lo_a % 2 + 2) % 2)) % 2 + 2) % 2;
-            while pa <= hi_a {
-                let pb = target - pa;
-                if pb >= lo_b && pb <= hi_b && ((pb % 2 + 2) % 2) == par_b {
-                    let mut new_cand = *cand;
-                    new_cand[i_mod3] = pa;
-                    new_cand[i_mod3 + 3] = pb;
-                    new_candidates.push(new_cand);
-                }
-                pa += 2;
-            }
+        let mut p6_2 = plo2 + ((ppar2 - ((plo2 % 2 + 2) % 2)) % 2 + 2) % 2;
+        while p6_2 <= phi2 {
+            let p6_4 = e_c - p6_0 - p6_2;
+            if p6_4 < plo4 || p6_4 > phi4 || ((p6_4 % 2 + 2) % 2) != ppar4 { p6_2 += 2; continue; }
+            let p6_1 = mod3_sol.p[1] - p6_4;
+            if p6_1 < plo1 || p6_1 > phi1 || ((p6_1 % 2 + 2) % 2) != ppar1 { p6_2 += 2; continue; }
+            let p6_5 = mod3_sol.p[2] - p6_2;
+            if p6_5 < plo5 || p6_5 > phi5 || ((p6_5 % 2 + 2) % 2) != ppar5 { p6_2 += 2; continue; }
+            p_candidates.push([p6_0, p6_1, p6_2, p6_3, p6_4, p6_5]);
+            p6_2 += 2;
         }
-        p_candidates = new_candidates;
+        p6_0 += 2;
     }
 
-    // Similarly for q values
+    let (qlo0, qhi0, qpar0) = q_bounds[0];
+    let (qlo1, qhi1, qpar1) = q_bounds[1];
+    let (qlo2, qhi2, qpar2) = q_bounds[2];
+    let (qlo3, qhi3, qpar3) = q_bounds[3];
+    let (qlo4, qhi4, qpar4) = q_bounds[4];
+    let (qlo5, qhi5, qpar5) = q_bounds[5];
+
+    // For each p6 candidate, enumerate q6: 2 free params (q6[0] and q6[2])
     for p_cand in &p_candidates {
-        let mut q_candidates: Vec<[i32; 6]> = vec![[0; 6]];
+        let mut q6_0 = qlo0 + ((qpar0 - ((qlo0 % 2 + 2) % 2)) % 2 + 2) % 2;
+        while q6_0 <= qhi0 {
+            let q6_3 = mod3_sol.q[0] - q6_0;
+            if q6_3 < qlo3 || q6_3 > qhi3 || ((q6_3 % 2 + 2) % 2) != qpar3 { q6_0 += 2; continue; }
 
-        for i_mod3 in 0..3 {
-            let target = mod3_sol.q[i_mod3];
-            let (lo_a, hi_a, par_a) = q_bounds[i_mod3];
-            let (lo_b, hi_b, par_b) = q_bounds[i_mod3 + 3];
+            let mut q6_2 = qlo2 + ((qpar2 - ((qlo2 % 2 + 2) % 2)) % 2 + 2) % 2;
+            while q6_2 <= qhi2 {
+                let q6_4 = e_d - q6_0 - q6_2;
+                if q6_4 < qlo4 || q6_4 > qhi4 || ((q6_4 % 2 + 2) % 2) != qpar4 { q6_2 += 2; continue; }
+                let q6_1 = mod3_sol.q[1] - q6_4;
+                if q6_1 < qlo1 || q6_1 > qhi1 || ((q6_1 % 2 + 2) % 2) != qpar1 { q6_2 += 2; continue; }
+                let q6_5 = mod3_sol.q[2] - q6_2;
+                if q6_5 < qlo5 || q6_5 > qhi5 || ((q6_5 % 2 + 2) % 2) != qpar5 { q6_2 += 2; continue; }
+                let q_cand = [q6_0, q6_1, q6_2, q6_3, q6_4, q6_5];
 
-            let mut new_candidates = Vec::new();
-            for cand in &q_candidates {
-                let mut qa = lo_a + ((par_a - ((lo_a % 2 + 2) % 2)) % 2 + 2) % 2;
-                while qa <= hi_a {
-                    let qb = target - qa;
-                    if qb >= lo_b && qb <= hi_b && ((qb % 2 + 2) % 2) == par_b {
-                        let mut new_cand = *cand;
-                        new_cand[i_mod3] = qa;
-                        new_cand[i_mod3 + 3] = qb;
-                        new_candidates.push(new_cand);
+                // Check Eq 2.10 sum-of-squares feasibility
+                let pq_sq: i32 = p_cand.iter().chain(q_cand.iter()).map(|x| x * x).sum();
+                let target_sq = (4 * n + 2) as i32;
+                if pq_sq > target_sq { q6_2 += 2; continue; }
+
+                // Check Eq 2.12 for CD at m=6:
+                // p_{j,6} + q_{j,6} + p_{n+1-j,6} + q_{n+1-j,6} = 0 (mod 4) for j=1,...,6
+                let mut cd_mod4_ok = true;
+                for j in 1..=m {
+                    let res_pair = if (n + 1 - j) % m == 0 { m } else { (n + 1 - j) % m };
+                    let sum_j = p_cand[j - 1] + q_cand[j - 1] + p_cand[res_pair - 1] + q_cand[res_pair - 1];
+                    if ((sum_j % 4) + 4) % 4 != 0 {
+                        cd_mod4_ok = false;
+                        break;
                     }
-                    qa += 2;
                 }
-            }
-            q_candidates = new_candidates;
-        }
+                if !cd_mod4_ok { q6_2 += 2; continue; }
 
-        for q_cand in &q_candidates {
-            // Check Eq 2.10 constraints at m=6 for PQ part only:
-            // We need sum(p_i^2 + q_i^2) to be feasible (not exceed 4n+2)
-            let pq_sq: i32 = p_cand.iter().chain(q_cand.iter()).map(|x| x * x).sum();
-            let target_sq = (4 * n + 2) as i32;
-            if pq_sq > target_sq { continue; }
-
-            // Check Eq 2.10 orthogonality for CD part at m=6:
-            // For s=1,...,3: N_P(s)+N_Q(s)+N_P(6-s)+N_Q(6-s) should contribute correctly
-            // We check the combined KRPQ orthogonality later when checking AB feasibility.
-            // For now, just check CD-only partial orthogonality is not obviously wrong.
-
-            // Check Eq 2.12 for CD at m=6:
-            // p_{j,6} + q_{j,6} + p_{n+1-j,6} + q_{n+1-j,6} = 0 (mod 4) for j=1,...,6
-            let mut cd_mod4_ok = true;
-            for j in 1..=m {
-                let res_pair = if (n + 1 - j) % m == 0 { m } else { (n + 1 - j) % m };
-                let sum_j = p_cand[j - 1] + q_cand[j - 1] + p_cand[res_pair - 1] + q_cand[res_pair - 1];
-                if ((sum_j % 4) + 4) % 4 != 0 {
-                    cd_mod4_ok = false;
-                    break;
+                // Check that at least one valid AB mod-6 exists (feasibility check)
+                let feasible = check_mod6_ab_feasible(n, mod3_sol, p_cand, &q_cand, target_sq - pq_sq);
+                if feasible {
+                    let sol = Mod6CDSolution {
+                        p: *p_cand,
+                        q: q_cand,
+                        _mod3_idx: mod3_idx,
+                    };
+                    if !callback(&sol) { return; }
                 }
-            }
-            if !cd_mod4_ok { continue; }
 
-            // Check that at least one valid AB mod-6 exists (feasibility check)
-            let feasible = check_mod6_ab_feasible(n, mod3_sol, p_cand, q_cand, target_sq - pq_sq);
-            if feasible {
-                let sol = Mod6CDSolution {
-                    p: *p_cand,
-                    q: *q_cand,
-                    _mod3_idx: mod3_idx,
-                };
-                if !callback(&sol) { return; }
+                q6_2 += 2;
             }
+            q6_0 += 2;
         }
     }
 }
@@ -1562,6 +1580,10 @@ fn backtrack_cd_from_mod6(
         let (left, right, lc, rc) = pair_positions[pair_idx];
         let choices: &[(i32, i32, i32, i32)] = if pair_idx == 0 { all_16 } else { valid_pairs_cd };
 
+        // Precompute trig sums for this pair's two positions (same for all options)
+        let left_off = left * na;
+        let right_off = right * na;
+
         for &(ci, di, cj, dj) in choices {
             // Apply mod-6 running sums
             c_running[lc] += ci;
@@ -1590,18 +1612,63 @@ fn backtrack_cd_from_mod6(
             }
 
             if feasible {
+                let ci_f = ci as f64;
+                let di_f = di as f64;
+                let cj_f = cj as f64;
+                let dj_f = dj as f64;
+
+                // Quick spectral pre-screen: check 8 evenly-spaced angles before
+                // doing the full O(400) update. Computes what magnitude WOULD be
+                // and applies lower-bound check. Avoids expensive update+undo for
+                // obviously doomed options.
+                let unfilled_pre = 2 * (num_pairs - pair_idx - 1)
+                    + if has_middle { 1 } else { 0 };
+                let mut pre_ok = true;
+                if unfilled_pre > 0 && unfilled_pre <= 16 {
+                    let u_pre = unfilled_pre as f64;
+                    let st_pre = spectral_threshold;
+                    // Check every 50th angle (8 angles out of 400)
+                    let stride = na / 8;
+                    for ki in 0..8 {
+                        let k = ki * stride;
+                        if k >= na { break; }
+                        let cl = trig_cos[left_off + k];
+                        let sl = trig_sin[left_off + k];
+                        let cr = trig_cos[right_off + k];
+                        let sr = trig_sin[right_off + k];
+                        let new_rc = real_c[k] + ci_f * cl + cj_f * cr;
+                        let new_ic = imag_c[k] + ci_f * sl + cj_f * sr;
+                        let new_rd = real_d[k] + di_f * cl + dj_f * cr;
+                        let new_id = imag_d[k] + di_f * sl + dj_f * sr;
+                        let rc2 = new_rc * new_rc + new_ic * new_ic;
+                        let rd2 = new_rd * new_rd + new_id * new_id;
+                        let mag_c_v = rc2.sqrt();
+                        let mag_d_v = rd2.sqrt();
+                        let lb_c = if mag_c_v > u_pre { mag_c_v - u_pre } else { 0.0 };
+                        let lb_d = if mag_d_v > u_pre { mag_d_v - u_pre } else { 0.0 };
+                        if lb_c * lb_c + lb_d * lb_d > st_pre {
+                            pre_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !pre_ok {
+                    // Undo mod-6 running sums and skip
+                    c_running[lc] -= ci;
+                    d_running[lc] -= di;
+                    c_running[rc] -= cj;
+                    d_running[rc] -= dj;
+                    filled[lc] -= 1;
+                    filled[rc] -= 1;
+                    continue;
+                }
+
                 c_vals[left] = ci;
                 d_vals[left] = di;
                 c_vals[right] = cj;
                 d_vals[right] = dj;
 
                 // Update spectral state incrementally
-                let ci_f = ci as f64;
-                let di_f = di as f64;
-                let cj_f = cj as f64;
-                let dj_f = dj as f64;
-                let left_off = left * na;
-                let right_off = right * na;
                 for k in 0..na {
                     let cl = trig_cos[left_off + k];
                     let sl = trig_sin[left_off + k];
@@ -1632,9 +1699,11 @@ fn backtrack_cd_from_mod6(
                 if unfilled > 0 {
                     let u = unfilled as f64;
                     // V7: Scaled tiers for 400 angles
-                    let check_angles = if unfilled <= 2 { na }         // 400 angles
-                        else if unfilled <= 4 { na * 3 / 4 }          // 300 angles
-                        else if unfilled <= 8 { na / 2 }              // 200 angles
+                    // At medium depths (unfilled 4-8), pruning is effective and saves
+                    // exponential work — use more angles. At shallow depths (unfilled > 16),
+                    // lower bounds are zero so more angles don't help.
+                    let check_angles = if unfilled <= 4 { na }         // 400 angles
+                        else if unfilled <= 8 { na * 3 / 4 }          // 300 angles
                         else if unfilled <= 16 { na / 4 }             // 100 angles
                         else { na / 8 };                              // 50 angles
                     let st = spectral_threshold;
@@ -2710,7 +2779,7 @@ fn run_debug_pipeline(n: usize) {
 
     if let Some(mod3_idx) = known_mod3_idx {
         let mod3_sol = &mod3_solutions[mod3_idx];
-        let mod6_solutions = collect_mod6_cd_solutions(n, mod3_sol, mod3_idx, 100_000);
+        let mod6_solutions = collect_mod6_cd_solutions(n, mod3_sol, mod3_idx, &known_st, &known_at, 100_000);
         println!("  Total mod-6 CD solutions from known mod-3 (index {}): {}", mod3_idx, mod6_solutions.len());
 
         let mut known_mod6_found = false;
@@ -3007,7 +3076,7 @@ fn run_debug_pipeline(n: usize) {
     println!("  Mod-3 solution found: {}", if known_mod3_found { "YES" } else { "NO" });
     if known_mod3_idx.is_some() {
         let mod3_sol = &mod3_solutions[known_mod3_idx.unwrap()];
-        let mod6_solutions = collect_mod6_cd_solutions(n, mod3_sol, known_mod3_idx.unwrap(), 100_000);
+        let mod6_solutions = collect_mod6_cd_solutions(n, mod3_sol, known_mod3_idx.unwrap(), &known_st, &known_at, 100_000);
         let mod6_found = mod6_solutions.iter().any(|s| s.p == known_mod6_p && s.q == known_mod6_q);
         println!("  Mod-6 CD solution found: {}", if mod6_found { "YES" } else { "NO" });
 
@@ -3071,7 +3140,7 @@ fn run_pipeline_stats(n: usize) {
         let max_mod3 = mod3_sols.len().min(50);
         for (m3_idx, mod3_sol) in mod3_sols.iter().take(max_mod3).enumerate() {
             // Step 3: Mod-6
-            let mod6_sols = collect_mod6_cd_solutions(n, mod3_sol, m3_idx, 100_000);
+            let mod6_sols = collect_mod6_cd_solutions(n, mod3_sol, m3_idx, st, at, 100_000);
             tuple_mod6 += mod6_sols.len() as u64;
 
             for mod6_sol in &mod6_sols {
@@ -3494,7 +3563,7 @@ fn main() {
                 // Step 3: Mod-6 CD streaming (Theorem 2.3, m=6)
                 let spectral_margin = 1e-6;
 
-                enumerate_mod6_cd_solutions(n, &mod3_sol, m3_idx, &mut |mod6_sol| {
+                enumerate_mod6_cd_solutions(n, &mod3_sol, m3_idx, st, at, &mut |mod6_sol| {
                     if found.load(Ordering::Relaxed) { return false; }
                     total_mod6_found.fetch_add(1, Ordering::Relaxed);
 

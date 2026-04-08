@@ -15,6 +15,7 @@ rayon = "1.8"
 rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+core_affinity = "0.8.3"
 
 [[bin]]
 name = "find_bs_generic_v5"
@@ -39,3 +40,7 @@ path = "rust_code/find_bs_v6_parallel.rs"
 [[bin]]
 name = "find_bs_n44_13_instances"
 path = "rust_code/find_bs_n44_13_instances.rs"
+
+[[bin]]
+name = "find_bs_v7_parallel"
+path = "rust_code/find_bs_v7_parallel.rs"
