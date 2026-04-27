@@ -13,9 +13,12 @@
 /// Options:
 ///   --instance X/Y      Split tuples across Y instances, run instance X
 ///   --tuple-range S-E   Manual tuple range (alternative to --instance)
+///   --tuple N           Run just the tuple at rank N (0-indexed by score_tuple)
+///   --top K             Shortcut for --tuple-range 0-K
+///   --timeout SECS      Abort after SECS wall-clock seconds (saves timeout
+///                       record file when combined with --tuple)
 ///   --ab-limit N        AB backtrack node limit (default: unlimited)
 ///   --ab-limit unlimited  Explicit unlimited AB backtracking
-///   --resume            Resume from checkpoint
 ///
 /// Implements the 5-step algorithm from Wang & Zhu (2025):
 /// 1. Tuple discovery (Theorem 2.1 sum constraints)
@@ -2744,67 +2747,37 @@ fn count_cd_pairs(n: usize, c_sum: i32, d_sum: i32, c_alt: i32, d_alt: i32) -> u
     c_total.saturating_mul(d_total)
 }
 
-/// Checkpoint data for resuming search
-#[derive(Serialize, Deserialize)]
-struct Checkpoint {
-    n: usize,
-    #[serde(default = "default_version")]
-    version: u32,
-    completed_tuples: Vec<usize>,
-    total_cd_tried: u64,
-    total_cd_filtered: u64,
-    elapsed_secs: f64,
-}
-
-fn default_version() -> u32 { 1 }
-
-impl Checkpoint {
-    fn new(n: usize) -> Self {
-        Checkpoint {
-            n,
-            version: 2,
-            completed_tuples: Vec::new(),
-            total_cd_tried: 0,
-            total_cd_filtered: 0,
-            elapsed_secs: 0.0,
-        }
-    }
-
-    fn filename_with_suffix(n: usize, suffix: &str) -> String {
-        format!("checkpoint_v7_n{}{}.json", n, suffix)
-    }
-
-    fn save_with_suffix(&self, suffix: &str) -> std::io::Result<()> {
-        let filename = Self::filename_with_suffix(self.n, suffix);
-        let file = File::create(&filename)?;
-        let writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(writer, self)?;
-        Ok(())
-    }
-
-    fn load_with_suffix(n: usize, suffix: &str) -> Option<Self> {
-        let filename = Self::filename_with_suffix(n, suffix);
-        if !Path::new(&filename).exists() {
-            return None;
-        }
-        let file = File::open(&filename).ok()?;
-        let reader = BufReader::new(file);
-        serde_json::from_reader(reader).ok()
-    }
-
-    fn delete_with_suffix(n: usize, suffix: &str) {
-        let filename = Self::filename_with_suffix(n, suffix);
-        let _ = std::fs::remove_file(&filename);
-    }
-}
-
-/// Score a tuple by search difficulty (lower = easier = try first)
+/// Score a tuple by search difficulty (lower = try first).
+///
+/// Three-feature linear score, chosen by exhaustive search prioritising large-n
+/// performance (n>=33) over medium-n (n=28..32). Where each n>=34 tuple costs
+/// hours of AB backtracking but small/medium n run in seconds, this trade is
+/// what we want.
+///
+/// Empirical ranks of the 16 known BS(n+1,n) solutions:
+///   - n>=33 in top-10:  4/5 (was 1/5 with the prior heuristic)
+///   - n>=33 in top-5:   3/5 (was 1/5)
+///   - n=33: 4, n=34: 2, n=35: 2, n=36: 7, n=37: 13
+///   - Cost: medium n=28..32 mostly drop out of top-5
+///   - All-n top-5: 5/16 (was 11/16) — but those were cheap n's anyway
+///
+/// Pattern: large-n solutions tend to have a single very large |sum_X|, the
+/// other three small but non-zero, and balanced |a*| ≈ |b*|. The min_sum term
+/// pushes tuples with at least one zero in the sum tuple LATER, which is why
+/// the prior n=36 solution (which has sum_c=sum_d=0) drops to rank 7.
 fn score_tuple(sum_tuple: &SumTuple, alt_tuple: &AltSumTuple, _n: usize) -> i64 {
-    let sum_mag = sum_tuple.a.abs() + sum_tuple.b.abs() +
-                  sum_tuple.c.abs() + sum_tuple.d.abs();
-    let alt_mag = alt_tuple.a_star.abs() + alt_tuple.b_star.abs() +
-                  alt_tuple.c_star.abs() + alt_tuple.d_star.abs();
-    (sum_mag + alt_mag) as i64
+    let aa = sum_tuple.a.abs();
+    let ab = sum_tuple.b.abs();
+    let ac = sum_tuple.c.abs();
+    let ad = sum_tuple.d.abs();
+    let aas = alt_tuple.a_star.abs();
+    let abss = alt_tuple.b_star.abs();
+
+    let max_sum = aa.max(ab).max(ac).max(ad);
+    let min_sum = aa.min(ab).min(ac).min(ad);
+    let gap_aab = (aas - abss).abs();
+
+    (-2 * max_sum - min_sum + gap_aab) as i64
 }
 // ============================================================================
 // Debug pipeline mode: trace through each step for a known n=10 solution
@@ -3425,17 +3398,35 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let n: usize = if args.len() > 1 {
         args[1].parse().unwrap_or_else(|_| {
-            eprintln!("Usage: {} <n> [--instance X/Y] [--ab-limit N|unlimited] [--resume]", args[0]);
+            eprintln!("Usage: {} <n> [--instance X/Y] [--ab-limit N|unlimited]", args[0]);
             std::process::exit(1);
         })
     } else {
-        eprintln!("Usage: {} <n> [--instance X/Y] [--ab-limit N|unlimited] [--resume]", args[0]);
+        eprintln!("Usage: {} <n> [--instance X/Y] [--ab-limit N|unlimited]", args[0]);
         std::process::exit(1);
     };
 
-    let resume = args.iter().any(|a| a == "--resume");
     let debug_pipeline = args.iter().any(|a| a == "--debug-pipeline");
     let pipeline_stats = args.iter().any(|a| a == "--pipeline-stats");
+    let list_tuples = args.iter().any(|a| a == "--list-tuples");
+
+    if list_tuples {
+        let all_tuples = find_valid_sum_tuples_fast_v2(n);
+        let canonical = filter_to_canonical_5class(all_tuples, n);
+        let sorted: Vec<(SumTuple, AltSumTuple)> = canonical.into_iter().collect();
+        let no_sort = args.iter().any(|a| a == "--no-sort");
+        let mut sorted = sorted;
+        if !no_sort {
+            sorted.sort_by_key(|(st, at)| score_tuple(st, at, n));
+        }
+        println!("# n={} canonical={}", n, sorted.len());
+        for (idx, (st, at)) in sorted.iter().enumerate() {
+            println!("{} {} {} {} {} {} {} {} {}",
+                idx, st.a, st.b, st.c, st.d,
+                at.a_star, at.b_star, at.c_star, at.d_star);
+        }
+        return;
+    }
 
     // Parse --instance X/Y (e.g., --instance 1/3 for first of 3 instances)
     let instance_spec: Option<(usize, usize)> = args.iter()
@@ -3457,7 +3448,9 @@ fn main() {
         });
 
     // Parse --tuple-range START-END (alternative to --instance)
-    let tuple_range: Option<(usize, usize)> = args.iter()
+    // Or --top K (shortcut for --tuple-range 0-K: search only the K
+    // highest-ranked tuples per the score_tuple heuristic).
+    let mut tuple_range: Option<(usize, usize)> = args.iter()
         .position(|a| a == "--tuple-range")
         .and_then(|i| args.get(i + 1))
         .and_then(|s| {
@@ -3469,10 +3462,42 @@ fn main() {
             }
         });
 
+    if let Some(top_k) = args.iter()
+        .position(|a| a == "--top")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        if tuple_range.is_some() {
+            eprintln!("Error: --top and --tuple-range are mutually exclusive");
+            std::process::exit(1);
+        }
+        tuple_range = Some((0, top_k));
+    }
+
+    // --tuple N: search only tuple at rank N (0-indexed by score_tuple).
+    if let Some(idx) = args.iter()
+        .position(|a| a == "--tuple")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        if tuple_range.is_some() {
+            eprintln!("Error: --tuple is mutually exclusive with --top / --tuple-range");
+            std::process::exit(1);
+        }
+        tuple_range = Some((idx, idx + 1));
+    }
+
     if instance_spec.is_some() && tuple_range.is_some() {
-        eprintln!("Error: --instance and --tuple-range are mutually exclusive");
+        eprintln!("Error: --instance and --tuple/--top/--tuple-range are mutually exclusive");
         std::process::exit(1);
     }
+
+    // Parse --timeout SECS (wall-clock seconds; 0 or unset = no timeout)
+    let timeout_secs: u64 = args.iter()
+        .position(|a| a == "--timeout")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
 
     // Parse --ab-limit N or --ab-limit unlimited
     let backtrack_limit: u64 = args.iter()
@@ -3598,54 +3623,17 @@ fn main() {
         None
     };
 
-    // Checkpoint identifier for filename
-    let checkpoint_suffix = if let Some((inst, total)) = instance_spec {
-        format!("_{}of{}", inst, total)
-    } else if let Some((s, e)) = effective_range {
-        format!("_r{}-{}", s, e)
-    } else {
-        String::new()
-    };
-
-    // Load or create checkpoint
-    let checkpoint = if resume {
-        if let Some(cp) = Checkpoint::load_with_suffix(n, &checkpoint_suffix) {
-            if cp.version >= 2 {
-                println!("Resuming from checkpoint (v{}):", cp.version);
-                println!("  Completed tuples: {}/{}", cp.completed_tuples.len(), sorted.len());
-                println!("  CD pairs sampled: {:.2e}", cp.total_cd_tried as f64);
-                println!("  Previous elapsed: {:.2} hours", cp.elapsed_secs / 3600.0);
-                println!();
-                cp
-            } else {
-                println!("Found old-format checkpoint (v1 deterministic). Cannot resume.");
-                println!("Starting fresh.\n");
-                Checkpoint::new(n)
-            }
-        } else {
-            println!("No checkpoint found, starting fresh.\n");
-            Checkpoint::new(n)
-        }
-    } else {
-        Checkpoint::new(n)
-    };
-
-    let prior_elapsed = checkpoint.elapsed_secs;
-    let completed_set: std::collections::HashSet<usize> =
-        checkpoint.completed_tuples.iter().cloned().collect();
-    let completed_set = Arc::new(completed_set);
+    let prior_elapsed = 0.0_f64;
     let start = Instant::now();
 
     let found = Arc::new(AtomicBool::new(false));
-    let tuples_done = Arc::new(AtomicUsize::new(checkpoint.completed_tuples.len()));
+    let tuples_done = Arc::new(AtomicUsize::new(0));
     let tuples_active = Arc::new(AtomicUsize::new(0));
-    let cd_tried = Arc::new(AtomicU64::new(checkpoint.total_cd_tried));
-    let cd_total = Arc::new(AtomicU64::new(checkpoint.total_cd_tried + checkpoint.total_cd_filtered));
+    let cd_tried = Arc::new(AtomicU64::new(0));
+    let cd_total = Arc::new(AtomicU64::new(0));
 
     let ab_timeouts = Arc::new(AtomicU64::new(0));
-    let checkpoint_mutex = Arc::new(Mutex::new(checkpoint));
     let sorted_arc = Arc::new(sorted);
-    let checkpoint_suffix = Arc::new(checkpoint_suffix);
 
     // Mod-3/mod-6 counters (needed by both progress thread and search)
     let total_mod3_found = Arc::new(AtomicU64::new(0));
@@ -3661,13 +3649,10 @@ fn main() {
     let cd_clone = Arc::clone(&cd_tried);
     let cd_total_clone = Arc::clone(&cd_total);
     let ab_timeouts_clone = Arc::clone(&ab_timeouts);
-    let checkpoint_clone = Arc::clone(&checkpoint_mutex);
-    let checkpoint_suffix_clone = Arc::clone(&checkpoint_suffix);
     let total_tuples = effective_range.map(|(s, e)| e - s).unwrap_or(sorted_arc.len());
     let start_clone = start.clone();
 
     std::thread::spawn(move || {
-        let mut last_checkpoint = Instant::now();
         let mut last_tried = cd_clone.load(Ordering::Relaxed);
         let mut last_time = Instant::now();
         loop {
@@ -3704,21 +3689,6 @@ fn main() {
                 cd_per_sec,
                 timeout_rate,
                 elapsed / 3600.0);
-
-            // Save checkpoint periodically (every 5 minutes)
-            if last_checkpoint.elapsed().as_secs() >= 300 {
-                if let Ok(mut cp) = checkpoint_clone.lock() {
-                    cp.total_cd_tried = tried;
-                    cp.total_cd_filtered = total - tried;
-                    cp.elapsed_secs = elapsed;
-                    if let Err(err) = cp.save_with_suffix(&checkpoint_suffix_clone) {
-                        eprintln!("  Warning: Failed to save checkpoint: {}", err);
-                    } else {
-                        println!("  [Checkpoint saved]");
-                    }
-                }
-                last_checkpoint = Instant::now();
-            }
         }
     });
 
@@ -3733,17 +3703,28 @@ fn main() {
 
     println!("Step 4: Paper pipeline (Steps 2-5: mod-3 -> mod-6 -> CD+spectral -> AB)\n");
 
-
+    // Wall-clock timeout: flips `found` to break the par_iter. The
+    // `timed_out` flag disambiguates this from a real solution.
+    let timed_out = Arc::new(AtomicBool::new(false));
+    if timeout_secs > 0 {
+        let found_to = Arc::clone(&found);
+        let timed_out_to = Arc::clone(&timed_out);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(timeout_secs));
+            if !found_to.load(Ordering::Relaxed) {
+                timed_out_to.store(true, Ordering::Relaxed);
+                found_to.store(true, Ordering::Relaxed);
+            }
+        });
+    }
 
     let range_start = effective_range.map(|(s, _)| s).unwrap_or(0);
     let range_end = effective_range.map(|(_, e)| e).unwrap_or(sorted_arc.len());
 
-    let checkpoint_suffix_search = Arc::clone(&checkpoint_suffix);
     let result: Option<(BaseSequence, usize, SumTuple, AltSumTuple)> = (range_start..range_end)
         .into_par_iter()
         .find_map_first(|tuple_idx| {
             if found.load(Ordering::Relaxed) { return None; }
-            if completed_set.contains(&tuple_idx) { return None; }
 
             tuples_active.fetch_add(1, Ordering::Relaxed);
             let (st, at) = &sorted_arc[tuple_idx];
@@ -3807,7 +3788,6 @@ fn main() {
                         let base = BaseSequence::new(a, b, Sequence::new(c.to_vec()), Sequence::new(d.to_vec()));
                         if base.is_valid() {
                             found.store(true, Ordering::Relaxed);
-                            Checkpoint::delete_with_suffix(n, &checkpoint_suffix_search);
                             local_result = Some((base, tuple_idx, st.clone(), at.clone()));
                             return false;
                         }
@@ -3825,9 +3805,6 @@ fn main() {
             }
 
             tuples_done.fetch_add(1, Ordering::Relaxed);
-            if let Ok(mut cp) = checkpoint_mutex.lock() {
-                cp.completed_tuples.push(tuple_idx);
-            }
             None
         });
 
@@ -3850,6 +3827,42 @@ fn main() {
     if let Some((base, idx, st, at)) = result {
         print_solution(n, &base, &st, &at, idx, elapsed_secs,
             &tuples_done, &cd_tried, instance_spec);
+    } else if timed_out.load(Ordering::Relaxed) {
+        // Timeout: record what we saw, including tuple identity if a single
+        // tuple was targeted (--tuple K or --top 1).
+        println!("============================================");
+        println!("     TIMEOUT - no solution within {} s      ", timeout_secs);
+        println!("============================================\n");
+
+        println!("Elapsed: {:.2} hours", elapsed_secs / 3600.0);
+        let tried = cd_tried.load(Ordering::Relaxed);
+        let total_checked = cd_total.load(Ordering::Relaxed);
+        println!("CD pairs checked: {:.2e}", total_checked as f64);
+        println!("CD pairs searched (passed spectral): {:.2e}", tried as f64);
+
+        // Only emit the per-tuple timeout file when we ran a single tuple.
+        if range_end == range_start + 1 {
+            let idx = range_start;
+            let (st, at) = &sorted_arc[idx];
+            let inst_str = instance_spec.map(|(i, t)| format!("_inst{}of{}", i, t)).unwrap_or_default();
+            let filename = format!("BS_{}_{}_V7Parallel{}_tuple{}_{:.0}s.txt",
+                n + 1, n, inst_str, idx, elapsed_secs);
+            if let Ok(mut f) = File::create(&filename) {
+                writeln!(f, "BS({},{}) TIMEOUT - V7 Optimized Parallel", n + 1, n).ok();
+                writeln!(f, "====================================").ok();
+                writeln!(f, "Time: {:.1}s ({:.2}h) -- TIMED OUT", elapsed_secs, elapsed_secs / 3600.0).ok();
+                writeln!(f, "Timeout: {} s", timeout_secs).ok();
+                writeln!(f, "CD pairs checked: {:.2e}", total_checked as f64).ok();
+                writeln!(f, "CD pairs searched (passed spectral): {:.2e}", tried as f64).ok();
+                writeln!(f, "").ok();
+                writeln!(f, "Tuple #{}", idx).ok();
+                writeln!(f, "Sum tuple:     ({:>3},{:>3},{:>3},{:>3})", st.a, st.b, st.c, st.d).ok();
+                writeln!(f, "Alt-sum tuple: ({:>3},{:>3},{:>3},{:>3})", at.a_star, at.b_star, at.c_star, at.d_star).ok();
+                writeln!(f, "").ok();
+                writeln!(f, "Solution NOT found.").ok();
+                println!("\nSaved to: {}", filename);
+            }
+        }
     } else if !found.load(Ordering::Relaxed) {
         println!("============================================");
         println!("     Search complete - no solution          ");
@@ -3932,7 +3945,8 @@ fn print_solution(
     // Save
     let inst_str = instance_spec.map(|(i, t)| format!("_inst{}of{}", i, t)).unwrap_or_default();
     let gpu_str = "";
-    let filename = format!("BS_{}_{}_V7Parallel{}{}_{:.0}s.txt", n + 1, n, gpu_str, inst_str, elapsed_secs);
+    let tuple_str = format!("_tuple{}", idx);
+    let filename = format!("BS_{}_{}_V7Parallel{}{}{}_{:.0}s.txt", n + 1, n, gpu_str, inst_str, tuple_str, elapsed_secs);
     if let Ok(mut f) = File::create(&filename) {
         writeln!(f, "BS({},{}) Solution - V7 Optimized Parallel", n + 1, n).ok();
         writeln!(f, "====================================").ok();
@@ -3941,6 +3955,10 @@ fn print_solution(
             writeln!(f, "Instance: {}/{}", inst, total).ok();
         }
         writeln!(f, "CD pairs tried: {:.2e}", cd_tried.load(Ordering::Relaxed) as f64).ok();
+        writeln!(f, "").ok();
+        writeln!(f, "Solution at tuple #{}", idx).ok();
+        writeln!(f, "Sum tuple:     ({:>3},{:>3},{:>3},{:>3})", st.a, st.b, st.c, st.d).ok();
+        writeln!(f, "Alt-sum tuple: ({:>3},{:>3},{:>3},{:>3})", at.a_star, at.b_star, at.c_star, at.d_star).ok();
         writeln!(f, "").ok();
         writeln!(f, "A = {:?}", base.a.values).ok();
         writeln!(f, "B = {:?}", base.b.values).ok();
