@@ -2429,6 +2429,64 @@ fn backtrack_search_ab(
                         }
                     }
                 }
+
+                // Forced-sign tightening: when |st.a - a_sum| == rp, a-values pinned.
+                if shift_ok {
+                    let ar_val = st.a - *a_sum;
+                    let br_val = st.b - *b_sum;
+                    let a_forced = ar_val.abs() == rp;
+                    let b_forced = br_val.abs() == rp;
+                    if a_forced || b_forced {
+                        let a_sign = ar_val.signum();
+                        let b_sign = br_val.signum();
+                        let uf_lo = pair_idx + 1;
+                        let uf_hi = if m >= 2 + pair_idx { m - 2 - pair_idx } else { 0 };
+                        if uf_hi >= uf_lo {
+                            let alt_sum_uf: i32 = (uf_lo..=uf_hi).map(|i| alt_sign[i]).sum();
+                            let aar = at.a_star - *a_alt_sum;
+                            let bar = at.b_star - *b_alt_sum;
+                            if a_forced && alt_sum_uf * a_sign != aar { shift_ok = false; }
+                            if shift_ok && b_forced && alt_sum_uf * b_sign != bar { shift_ok = false; }
+                            if shift_ok {
+                                for s in (1..ready_shift).rev() {
+                                    let pac = partial_ac[s];
+                                    let mut det = 0i32;
+                                    let mut free_pairs = 0i32;
+                                    let upper = m.saturating_sub(s);
+                                    for i in 0..upper {
+                                        let j = i + s;
+                                        unsafe {
+                                            let a_i = *a.get_unchecked(i);
+                                            let a_j = *a.get_unchecked(j);
+                                            let i_filled = a_i != 0;
+                                            let j_filled = a_j != 0;
+                                            if i_filled && j_filled { continue; }
+                                            let pa_i = if i_filled { a_i } else { a_sign };
+                                            let pa_j = if j_filled { a_j } else { a_sign };
+                                            let pb_i = if i_filled { *b.get_unchecked(i) } else { b_sign };
+                                            let pb_j = if j_filled { *b.get_unchecked(j) } else { b_sign };
+                                            if a_forced { det += pa_i * pa_j; }
+                                            if b_forced { det += pb_i * pb_j; }
+                                            if !(a_forced && b_forced) { free_pairs += 1; }
+                                        }
+                                    }
+                                    let new_pac = pac + det;
+                                    if a_forced && b_forced {
+                                        if new_pac != 0 { shift_ok = false; break; }
+                                    } else {
+                                        if new_pac.abs() > free_pairs
+                                            || (new_pac & 1) != (free_pairs & 1)
+                                        {
+                                            shift_ok = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
             }
 
             // 4c. (The original 4b block below is now dead — kept structurally to avoid
@@ -2572,6 +2630,31 @@ fn backtrack_search_ab(
                             s3_la_has_cross = next_right - next_left == s3_la;
                         }
 
+                        // Level 4: precompute s4 coefficients for 4th-shift look-ahead.
+                        let s4_la = if next_ready >= 4 { next_ready - 3 } else { 0 };
+                        let do_s4_la = s4_la >= 1 && !next_is_middle && pair_idx + 1 < max_contrib_table.len();
+                        let s4_la_mc = if do_s4_la { max_contrib_table[pair_idx + 1][s4_la] } else { 0 };
+                        let mut s4_nla = 0i32;
+                        let mut s4_nlb = 0i32;
+                        let mut s4_nra = 0i32;
+                        let mut s4_nrb = 0i32;
+                        let mut s4_la_has_cross = false;
+                        if do_s4_la {
+                            if next_left >= s4_la && a[next_left - s4_la] != 0 {
+                                s4_nla += a[next_left - s4_la]; s4_nlb += b[next_left - s4_la];
+                            }
+                            if next_left + s4_la < m && next_left + s4_la != next_right && a[next_left + s4_la] != 0 {
+                                s4_nla += a[next_left + s4_la]; s4_nlb += b[next_left + s4_la];
+                            }
+                            if next_right >= s4_la && next_right - s4_la != next_left && a[next_right - s4_la] != 0 {
+                                s4_nra += a[next_right - s4_la]; s4_nrb += b[next_right - s4_la];
+                            }
+                            if next_right + s4_la < m && a[next_right + s4_la] != 0 {
+                                s4_nra += a[next_right + s4_la]; s4_nrb += b[next_right + s4_la];
+                            }
+                            s4_la_has_cross = next_right - next_left == s4_la;
+                        }
+
                         let mut any_ok = false;
                         for &(nai, nbi, naj, nbj) in &constraints[pair_idx + 1] {
                             let d = nai * nla + nbi * nlb + naj * nra + nbj * nrb
@@ -2607,6 +2690,17 @@ fn backtrack_search_ab(
                                     + if s3_la_has_cross { nai * naj + nbi * nbj } else { 0 };
                                 let new_pac_s3 = (partial_ac[s3_la] + s3_delta).abs();
                                 if new_pac_s3 > s3_la_mc || (new_pac_s3 & 1) != (s3_la_mc & 1) {
+                                    continue;
+                                }
+                            }
+
+                            // Level 4: check shift s4 = ready_shift-4
+                            if do_s4_la {
+                                let s4_delta = nai * s4_nla + nbi * s4_nlb
+                                    + naj * s4_nra + nbj * s4_nrb
+                                    + if s4_la_has_cross { nai * naj + nbi * nbj } else { 0 };
+                                let new_pac_s4 = (partial_ac[s4_la] + s4_delta).abs();
+                                if new_pac_s4 > s4_la_mc || (new_pac_s4 & 1) != (s4_la_mc & 1) {
                                     continue;
                                 }
                             }
@@ -2749,35 +2843,15 @@ fn count_cd_pairs(n: usize, c_sum: i32, d_sum: i32, c_alt: i32, d_alt: i32) -> u
 
 /// Score a tuple by search difficulty (lower = try first).
 ///
-/// Three-feature linear score, chosen by exhaustive search prioritising large-n
-/// performance (n>=33) over medium-n (n=28..32). Where each n>=34 tuple costs
-/// hours of AB backtracking but small/medium n run in seconds, this trade is
-/// what we want.
-///
-/// Empirical ranks of the 16 known BS(n+1,n) solutions:
-///   - n>=33 in top-10:  4/5 (was 1/5 with the prior heuristic)
-///   - n>=33 in top-5:   3/5 (was 1/5)
-///   - n=33: 4, n=34: 2, n=35: 2, n=36: 7, n=37: 13
-///   - Cost: medium n=28..32 mostly drop out of top-5
-///   - All-n top-5: 5/16 (was 11/16) — but those were cheap n's anyway
-///
-/// Pattern: large-n solutions tend to have a single very large |sum_X|, the
-/// other three small but non-zero, and balanced |a*| ≈ |b*|. The min_sum term
-/// pushes tuples with at least one zero in the sum tuple LATER, which is why
-/// the prior n=36 solution (which has sum_c=sum_d=0) drops to rank 7.
+/// Adopted from v6_parallel: simple sum-of-absolute-values across both the
+/// sum tuple and alt-sum tuple. Empirically preferred over the prior
+/// large-n-tuned heuristic.
 fn score_tuple(sum_tuple: &SumTuple, alt_tuple: &AltSumTuple, _n: usize) -> i64 {
-    let aa = sum_tuple.a.abs();
-    let ab = sum_tuple.b.abs();
-    let ac = sum_tuple.c.abs();
-    let ad = sum_tuple.d.abs();
-    let aas = alt_tuple.a_star.abs();
-    let abss = alt_tuple.b_star.abs();
-
-    let max_sum = aa.max(ab).max(ac).max(ad);
-    let min_sum = aa.min(ab).min(ac).min(ad);
-    let gap_aab = (aas - abss).abs();
-
-    (-2 * max_sum - min_sum + gap_aab) as i64
+    let sum_mag = sum_tuple.a.abs() + sum_tuple.b.abs() +
+                  sum_tuple.c.abs() + sum_tuple.d.abs();
+    let alt_mag = alt_tuple.a_star.abs() + alt_tuple.b_star.abs() +
+                  alt_tuple.c_star.abs() + alt_tuple.d_star.abs();
+    (sum_mag + alt_mag) as i64
 }
 // ============================================================================
 // Debug pipeline mode: trace through each step for a known n=10 solution
