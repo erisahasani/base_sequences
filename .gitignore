@@ -21,6 +21,7 @@ Thumbs.db
 # Solution output files (generated at runtime)
 *.txt
 
+
 # Log files
 *.log
 
@@ -30,8 +31,7 @@ SCALING_TO_BS_31_30.md
 
 *.json
 *.md
-*.sh
 *.py
 arXiv*
 test_delta_correctness.rs
-build.rs
+test_delta.sh
