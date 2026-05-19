@@ -38,7 +38,28 @@ use std::io::{Write, BufReader, BufWriter};
 use std::path::Path;
 use std::env;
 use serde::{Serialize, Deserialize};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+
+// Optional log file (set via --log <path>). Mirrors selected stdout output;
+// progress lines are written once per hour rather than every 30s.
+static LOG_FILE: OnceLock<Mutex<File>> = OnceLock::new();
+
+fn log_write(msg: &str) {
+    if let Some(m) = LOG_FILE.get() {
+        if let Ok(mut f) = m.lock() {
+            let _ = writeln!(f, "{}", msg);
+            let _ = f.flush();
+        }
+    }
+}
+
+macro_rules! log_println {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        println!("{}", msg);
+        $crate::log_write(&msg);
+    }};
+}
 
 // ============================================================================
 // Inlined from lib.rs: Sequence, BaseSequence, SumTuple, AltSumTuple
@@ -258,15 +279,15 @@ fn find_valid_sum_tuples_fast_v2(n: usize) -> Vec<(SumTuple, AltSumTuple)> {
     let max_sum_m = (n + 1) as i32;
     let max_sum_n = n as i32;
 
-    println!("  Phase 1: Finding valid (a,b,c,d) tuples...");
+    log_println!("  Phase 1: Finding valid (a,b,c,d) tuples...");
     let sum_tuples = find_sum_tuples(n, target, max_sum_m, max_sum_n);
-    println!("  Found {} valid (a,b,c,d) tuples", sum_tuples.len());
+    log_println!("  Found {} valid (a,b,c,d) tuples", sum_tuples.len());
 
-    println!("  Phase 2: Finding valid (a*,b*,c*,d*) tuples...");
+    log_println!("  Phase 2: Finding valid (a*,b*,c*,d*) tuples...");
     let alt_tuples = find_alt_tuples(n, target, max_sum_m, max_sum_n);
-    println!("  Found {} valid (a*,b*,c*,d*) tuples", alt_tuples.len());
+    log_println!("  Found {} valid (a*,b*,c*,d*) tuples", alt_tuples.len());
 
-    println!("  Phase 3: HashMap-based matching (Equation 2.4)...");
+    log_println!("  Phase 3: HashMap-based matching (Equation 2.4)...");
     let mut alt_by_signature: HashMap<Mod4Signature, Vec<AltSumTuple>> = HashMap::new();
     for at in alt_tuples {
         let sig = Mod4Signature::required_for_alt_tuple(&at, n);
@@ -283,7 +304,7 @@ fn find_valid_sum_tuples_fast_v2(n: usize) -> Vec<(SumTuple, AltSumTuple)> {
         }
     }
 
-    println!("  Found {} valid tuple pairs", valid_pairs.len());
+    log_println!("  Found {} valid tuple pairs", valid_pairs.len());
     valid_pairs
 }
 
@@ -484,7 +505,7 @@ fn filter_to_canonical_5class(tuples: Vec<(SumTuple, AltSumTuple)>, n: usize) ->
     } else {
         1.0
     };
-    println!("  5-class isomorphic filtering: {} -> {} tuples ({:.1}x reduction)",
+    log_println!("  5-class isomorphic filtering: {} -> {} tuples ({:.1}x reduction)",
              original_count, filtered_count, reduction_factor);
     canonical
 }
@@ -3410,6 +3431,22 @@ fn main() {
     let pipeline_stats = args.iter().any(|a| a == "--pipeline-stats");
     let list_tuples = args.iter().any(|a| a == "--list-tuples");
 
+    // Log file: mirrors all init/result output and writes one progress line per
+    // hour. Path comes from --log <PATH> if given, otherwise auto-generated
+    // from n and (when --tuple is used) the tuple index.
+    let explicit_log = args.iter().position(|a| a == "--log").and_then(|i| args.get(i + 1)).cloned();
+    let tuple_for_log = args.iter().position(|a| a == "--tuple")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<usize>().ok());
+    let log_path = explicit_log.unwrap_or_else(|| match tuple_for_log {
+        Some(k) => format!("BS_{}_{}_V7Parallel_tuple{}_progress.log", n + 1, n, k),
+        None => format!("BS_{}_{}_V7Parallel_progress.log", n + 1, n),
+    });
+    match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        Ok(f) => { let _ = LOG_FILE.set(Mutex::new(f)); }
+        Err(e) => { eprintln!("Warning: could not open log file {}: {}", log_path, e); }
+    }
+
     if list_tuples {
         let all_tuples = find_valid_sum_tuples_fast_v2(n);
         let canonical = filter_to_canonical_5class(all_tuples, n);
@@ -3543,26 +3580,26 @@ fn main() {
                 .unwrap_or_else(|_| {
                     eprintln!("Warning: Failed to set up pinned thread pool, using default");
                 });
-            println!("V7: CPU pinning enabled ({} cores)", num_cores);
+            log_println!("V7: CPU pinning enabled ({} cores)", num_cores);
         }
     }
 
     let instance_label = instance_spec.map(|(i, t)| format!("[Instance {}/{}] ", i, t)).unwrap_or_default();
-    println!("{}BS({},{}) - V7 Optimized Parallel Search", instance_label, n + 1, n);
-    println!("==============================================\n");
+    log_println!("{}BS({},{}) - V7 Optimized Parallel Search", instance_label, n + 1, n);
+    log_println!("==============================================\n");
 
     let num_threads = rayon::current_num_threads();
-    println!("Threads: {} (rayon, pinned)", num_threads);
+    log_println!("Threads: {} (rayon, pinned)", num_threads);
 
     let limit_str = if backtrack_limit == u64::MAX {
         "unlimited".to_string()
     } else {
         format!("{}M nodes", backtrack_limit / 1_000_000)
     };
-    println!("Configuration for n={}:", n);
-    println!("  Spectral margin: 1e-6 ({} angles)", NUM_SPECTRAL_ANGLES);
-    println!("  AB backtrack limit: {}", limit_str);
-    println!("  Two-level parallelism: tuples x mod-3 solutions (nested rayon)");
+    log_println!("Configuration for n={}:", n);
+    log_println!("  Spectral margin: 1e-6 ({} angles)", NUM_SPECTRAL_ANGLES);
+    log_println!("  AB backtrack limit: {}", limit_str);
+    log_println!("  Two-level parallelism: tuples x mod-3 solutions (nested rayon)");
     #[cfg(feature = "gpu")]
     {
     }
@@ -3570,25 +3607,25 @@ fn main() {
     {
     }
     if let Some((inst, total)) = instance_spec {
-        println!("  Instance: {}/{}", inst, total);
+        log_println!("  Instance: {}/{}", inst, total);
     }
     if let Some((start, end)) = tuple_range {
-        println!("  Tuple range: {}-{}", start, end);
+        log_println!("  Tuple range: {}-{}", start, end);
     }
-    println!();
+    log_println!("");
 
-    println!("Step 1: Find valid tuples...");
+    log_println!("Step 1: Find valid tuples...");
     let all_tuples = find_valid_sum_tuples_fast_v2(n);
-    println!("  {} raw tuples found", all_tuples.len());
+    log_println!("  {} raw tuples found", all_tuples.len());
 
-    println!("Step 2: Filter and sort by difficulty...");
+    log_println!("Step 2: Filter and sort by difficulty...");
     let canonical = filter_to_canonical_5class(all_tuples, n);
     let mut sorted: Vec<(SumTuple, AltSumTuple)> = canonical.into_iter().collect();
     sorted.sort_by_key(|(st, at)| score_tuple(st, at, n));
-    println!("  {} canonical tuples", sorted.len());
+    log_println!("  {} canonical tuples", sorted.len());
 
     // Calculate total CD pairs
-    println!("\nStep 3: Calculate search space...");
+    log_println!("\nStep 3: Calculate search space...");
     let mut tuple_cd_counts: Vec<u64> = Vec::with_capacity(sorted.len());
     let mut total_cd_pairs: u64 = 0;
 
@@ -3598,8 +3635,8 @@ fn main() {
         total_cd_pairs = total_cd_pairs.saturating_add(count);
     }
 
-    println!("  Total CD pairs: {:.2e}", total_cd_pairs as f64);
-    println!();
+    log_println!("  Total CD pairs: {:.2e}", total_cd_pairs as f64);
+    log_println!("");
 
     // Convert --instance to tuple range now that we know the tuple count
     let num_tuples = sorted.len();
@@ -3655,6 +3692,7 @@ fn main() {
     std::thread::spawn(move || {
         let mut last_tried = cd_clone.load(Ordering::Relaxed);
         let mut last_time = Instant::now();
+        let mut last_log_time = Instant::now();
         loop {
             std::thread::sleep(std::time::Duration::from_secs(30));
             if found_clone.load(Ordering::Relaxed) || search_done_clone.load(Ordering::Relaxed) { break; }
@@ -3681,7 +3719,8 @@ fn main() {
                 timeouts as f64 / tried as f64 * 100.0
             } else { 0.0 };
 
-            println!("  [{:>4}/{:>4} +{}] | {:.2e} pass / {:.2e} checked ({:.1}%) | {:.1}/s | {:.1}% tmout | {:.1}h",
+            let progress_line = format!(
+                "  [{:>4}/{:>4} +{}] | {:.2e} pass / {:.2e} checked ({:.1}%) | {:.1}/s | {:.1}% tmout | {:.1}h",
                 done, total_tuples, active,
                 tried as f64,
                 total as f64,
@@ -3689,6 +3728,13 @@ fn main() {
                 cd_per_sec,
                 timeout_rate,
                 elapsed / 3600.0);
+            println!("{}", progress_line);
+
+            // Append a progress line to the log file once per hour.
+            if last_log_time.elapsed().as_secs() >= 3600 {
+                log_write(&progress_line);
+                last_log_time = Instant::now();
+            }
         }
     });
 
@@ -3701,7 +3747,7 @@ fn main() {
     // Step 5: AB search via backtracking (Theorem 2.2)
     // ========================================================================
 
-    println!("Step 4: Paper pipeline (Steps 2-5: mod-3 -> mod-6 -> CD+spectral -> AB)\n");
+    log_println!("Step 4: Paper pipeline (Steps 2-5: mod-3 -> mod-6 -> CD+spectral -> AB)\n");
 
     // Wall-clock timeout: flips `found` to break the par_iter. The
     // `timed_out` flag disambiguates this from a real solution.
@@ -3915,12 +3961,12 @@ fn print_solution(
     }
     println!("Tuples checked: {}", tuples_done.load(Ordering::Relaxed));
     println!("CD pairs tried: {:.2e}", cd_tried.load(Ordering::Relaxed) as f64);
-    println!();
+    println!("");
 
     println!("Solution at tuple #{}", idx);
     println!("Sum tuple:     ({:>3},{:>3},{:>3},{:>3})", st.a, st.b, st.c, st.d);
     println!("Alt-sum tuple: ({:>3},{:>3},{:>3},{:>3})", at.a_star, at.b_star, at.c_star, at.d_star);
-    println!();
+    println!("");
 
     println!("A = {:?}", base.a.values);
     println!("B = {:?}", base.b.values);
