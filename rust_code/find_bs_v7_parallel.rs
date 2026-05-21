@@ -3537,7 +3537,10 @@ fn main() {
         .unwrap_or(0);
 
     // Parse --sub-instance X/Y: within a single tuple, process only every Y-th
-    // (mod3, mod6) pair (offset X-1). Lets you spread one tuple across Y nodes.
+    // spectral-passing CD (offset X-1). Sharding happens at CD level rather than
+    // (mod3, mod6) pair level so cost averages out across nodes — each node still
+    // sees every pair and runs CD generation + spectral filter, but only invokes
+    // AB search on its assigned CD slice.
     let sub_instance: Option<(usize, usize)> = args.iter()
         .position(|a| a == "--sub-instance")
         .and_then(|i| args.get(i + 1))
@@ -3627,7 +3630,7 @@ fn main() {
         log_println!("  Tuple range: {}-{}", start, end);
     }
     if let Some((x, y)) = sub_instance {
-        log_println!("  Sub-instance: {}/{} (this process handles every {}-th (mod3,mod6) pair, offset {})", x, y, y, x - 1);
+        log_println!("  Sub-instance: {}/{} (this process handles every {}-th spectral-passing CD, offset {})", x, y, y, x - 1);
     }
     log_println!("");
 
@@ -3832,22 +3835,28 @@ fn main() {
             }
             total_mod6_found.fetch_add(m3_m6_pairs.len() as u64, Ordering::Relaxed);
 
-            // Sub-instance: keep only every Y-th (mod3, mod6) pair, offset X-1.
-            if let Some((x, y)) = sub_instance {
-                m3_m6_pairs = m3_m6_pairs.into_iter().enumerate()
-                    .filter(|(idx, _)| idx % y == (x - 1))
-                    .map(|(_, p)| p)
-                    .collect();
-            }
-
             let result = m3_m6_pairs.into_par_iter().find_map_first(|(_mod3_sol, mod6_sol)| {
                 if found.load(Ordering::Relaxed) { return None; }
                 let mut local_result: Option<(BaseSequence, usize, SumTuple, AltSumTuple)> = None;
 
                 let ab_mod6_sols = enumerate_mod6_ab_solutions(n, st, at, &mod6_sol.p, &mod6_sol.q);
 
+                // Per-pair counter for CD-level sub-instance sharding. Each spectral-passing
+                // CD bumps it; if --sub-instance X/Y is set, only CDs where idx % Y == X-1
+                // proceed to AB search. CD generation + spectral filter still run on every
+                // node (cheap relative to AB).
+                let mut cd_local_idx: usize = 0;
+
                 backtrack_cd_from_mod6(n, &mod6_sol, spectral_margin, &mut |c, d| {
                     if found.load(Ordering::Relaxed) { return false; }
+
+                    let this_cd_idx = cd_local_idx;
+                    cd_local_idx += 1;
+                    if let Some((x, y)) = sub_instance {
+                        if this_cd_idx % y != (x - 1) {
+                            return true;
+                        }
+                    }
 
                     cd_tried.fetch_add(1, Ordering::Relaxed);
 
