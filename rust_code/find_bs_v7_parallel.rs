@@ -3536,6 +3536,20 @@ fn main() {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
 
+    // Parse --sub-instance X/Y: within a single tuple, process only every Y-th
+    // (mod3, mod6) pair (offset X-1). Lets you spread one tuple across Y nodes.
+    let sub_instance: Option<(usize, usize)> = args.iter()
+        .position(|a| a == "--sub-instance")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| {
+            let parts: Vec<&str> = s.split('/').collect();
+            if parts.len() != 2 { return None; }
+            let x: usize = parts[0].parse().ok()?;
+            let y: usize = parts[1].parse().ok()?;
+            if x == 0 || y == 0 || x > y { return None; }
+            Some((x, y))
+        });
+
     // Parse --ab-limit N or --ab-limit unlimited
     let backtrack_limit: u64 = args.iter()
         .position(|a| a == "--ab-limit")
@@ -3611,6 +3625,9 @@ fn main() {
     }
     if let Some((start, end)) = tuple_range {
         log_println!("  Tuple range: {}-{}", start, end);
+    }
+    if let Some((x, y)) = sub_instance {
+        log_println!("  Sub-instance: {}/{} (this process handles every {}-th (mod3,mod6) pair, offset {})", x, y, y, x - 1);
     }
     log_println!("");
 
@@ -3814,6 +3831,14 @@ fn main() {
                 });
             }
             total_mod6_found.fetch_add(m3_m6_pairs.len() as u64, Ordering::Relaxed);
+
+            // Sub-instance: keep only every Y-th (mod3, mod6) pair, offset X-1.
+            if let Some((x, y)) = sub_instance {
+                m3_m6_pairs = m3_m6_pairs.into_iter().enumerate()
+                    .filter(|(idx, _)| idx % y == (x - 1))
+                    .map(|(_, p)| p)
+                    .collect();
+            }
 
             let result = m3_m6_pairs.into_par_iter().find_map_first(|(_mod3_sol, mod6_sol)| {
                 if found.load(Ordering::Relaxed) { return None; }
