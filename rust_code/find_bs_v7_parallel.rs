@@ -3553,6 +3553,38 @@ fn main() {
             Some((x, y))
         });
 
+    // Parse --claim-dir <path>: enable filesystem-based work-stealing across nodes.
+    // Each spectral-passing CD belongs to a chunk; nodes claim chunks via atomic
+    // file creation (O_CREAT|O_EXCL) and only the one that succeeds runs AB on
+    // that chunk. Supersedes --sub-instance when set.
+    let claim_dir: Option<String> = args.iter()
+        .position(|a| a == "--claim-dir")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+
+    // --chunk-size N: number of spectral-passing CDs per claim. Smaller = finer
+    // load balance, more filesystem ops. Default 16.
+    let chunk_size: usize = args.iter()
+        .position(|a| a == "--chunk-size")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or(16);
+
+    // --reset-claims: wipe --claim-dir contents at startup. Safe to pass from
+    // every node in a multi-node job (races are benign: the worst outcome is
+    // duplicate work on a chunk that was claimed-then-wiped), but cleaner if
+    // the slurm script handles the cleanup once before srun.
+    let reset_claims = args.iter().any(|a| a == "--reset-claims");
+
+    // --found-flag <path>: shared sentinel file. A background thread polls it
+    // every 5s; if it appears, sets the in-process `found` flag and the search
+    // exits. The solution finder writes the file so peer nodes terminate.
+    let found_flag: Option<String> = args.iter()
+        .position(|a| a == "--found-flag")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+
     // Parse --ab-limit N or --ab-limit unlimited
     let backtrack_limit: u64 = args.iter()
         .position(|a| a == "--ab-limit")
@@ -3631,6 +3663,30 @@ fn main() {
     }
     if let Some((x, y)) = sub_instance {
         log_println!("  Sub-instance: {}/{} (this process handles every {}-th spectral-passing CD, offset {})", x, y, y, x - 1);
+    }
+    if let Some(ref dir) = claim_dir {
+        if reset_claims {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("Error: failed to create --claim-dir {}: {}", dir, e);
+            std::process::exit(1);
+        }
+        log_println!("  Claim dir: {} (chunk size {})", dir, chunk_size);
+        if reset_claims {
+            log_println!("  Reset claims: yes (existing claim files wiped at startup)");
+        }
+        if sub_instance.is_some() {
+            log_println!("  Note: --claim-dir supersedes --sub-instance (work-stealing instead of static stride)");
+        }
+    }
+    if let Some(ref f) = found_flag {
+        log_println!("  Found-flag: {} (polled every 5s; written on solution)", f);
+        // If sentinel already exists from a previous run, treat it as a hit and exit early.
+        if std::path::Path::new(f).exists() {
+            log_println!("  WARNING: found-flag already exists — exiting (delete it before rerun)");
+            return;
+        }
     }
     log_println!("");
 
@@ -3784,6 +3840,28 @@ fn main() {
         });
     }
 
+    // Cross-node early termination: poll the --found-flag sentinel file every
+    // 5s. If it appears (written by a peer node that found a solution), flip
+    // `found` so this process exits its par_iter and reports gracefully.
+    let peer_found = Arc::new(AtomicBool::new(false));
+    if let Some(ref flag_path) = found_flag {
+        let path = flag_path.clone();
+        let found_pf = Arc::clone(&found);
+        let peer_found_pf = Arc::clone(&peer_found);
+        let search_done_pf = Arc::clone(&search_done);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                if found_pf.load(Ordering::Relaxed) || search_done_pf.load(Ordering::Relaxed) { break; }
+                if std::path::Path::new(&path).exists() {
+                    peer_found_pf.store(true, Ordering::Relaxed);
+                    found_pf.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        });
+    }
+
     let range_start = effective_range.map(|(s, _)| s).unwrap_or(0);
     let range_end = effective_range.map(|(_, e)| e).unwrap_or(sorted_arc.len());
 
@@ -3835,27 +3913,49 @@ fn main() {
             }
             total_mod6_found.fetch_add(m3_m6_pairs.len() as u64, Ordering::Relaxed);
 
-            let result = m3_m6_pairs.into_par_iter().find_map_first(|(_mod3_sol, mod6_sol)| {
+            let claim_dir_ref = claim_dir.as_deref();
+            let result = m3_m6_pairs.into_par_iter().enumerate().find_map_first(|(pair_idx, (_mod3_sol, mod6_sol))| {
                 if found.load(Ordering::Relaxed) { return None; }
                 let mut local_result: Option<(BaseSequence, usize, SumTuple, AltSumTuple)> = None;
 
                 let ab_mod6_sols = enumerate_mod6_ab_solutions(n, st, at, &mod6_sol.p, &mod6_sol.q);
 
-                // Per-pair counter for CD-level sub-instance sharding. Each spectral-passing
-                // CD bumps it; if --sub-instance X/Y is set, only CDs where idx % Y == X-1
-                // proceed to AB search. CD generation + spectral filter still run on every
-                // node (cheap relative to AB).
+                // Per-pair counter for CD-level sharding. Each spectral-passing CD bumps it.
+                // Claim mode (--claim-dir): claims chunk_size CDs at a time via atomic file
+                // create on shared FS; only one node's claim succeeds per chunk.
+                // Sub-instance mode (--sub-instance X/Y): static stride, no FS coordination.
                 let mut cd_local_idx: usize = 0;
+                let mut current_chunk: Option<(usize, bool)> = None; // (chunk_start, claimed_by_us)
 
                 backtrack_cd_from_mod6(n, &mod6_sol, spectral_margin, &mut |c, d| {
                     if found.load(Ordering::Relaxed) { return false; }
 
                     let this_cd_idx = cd_local_idx;
                     cd_local_idx += 1;
-                    if let Some((x, y)) = sub_instance {
-                        if this_cd_idx % y != (x - 1) {
-                            return true;
+
+                    let proceed = if let Some(dir) = claim_dir_ref {
+                        let chunk_start = (this_cd_idx / chunk_size) * chunk_size;
+                        match current_chunk {
+                            Some((cs, claimed)) if cs == chunk_start => claimed,
+                            _ => {
+                                let path = format!("{}/t{}_p{}_c{}.claimed", dir, tuple_idx, pair_idx, chunk_start);
+                                let claimed = std::fs::OpenOptions::new()
+                                    .write(true)
+                                    .create_new(true)
+                                    .open(&path)
+                                    .is_ok();
+                                current_chunk = Some((chunk_start, claimed));
+                                claimed
+                            }
                         }
+                    } else if let Some((x, y)) = sub_instance {
+                        this_cd_idx % y == (x - 1)
+                    } else {
+                        true
+                    };
+
+                    if !proceed {
+                        return true;
                     }
 
                     cd_tried.fetch_add(1, Ordering::Relaxed);
@@ -3905,8 +4005,27 @@ fn main() {
     println!("\n");
 
     if let Some((base, idx, st, at)) = result {
+        // Write the cross-node sentinel so peer nodes terminate. Best-effort:
+        // a write failure here doesn't change correctness, just delays peers.
+        if let Some(ref flag_path) = found_flag {
+            if let Err(e) = std::fs::write(flag_path, format!("n={} tuple={} elapsed={:.0}s\n", n, idx, elapsed_secs)) {
+                eprintln!("Warning: failed to write --found-flag {}: {}", flag_path, e);
+            }
+        }
         print_solution(n, &base, &st, &at, idx, elapsed_secs,
             &tuples_done, &cd_tried, instance_spec);
+    } else if peer_found.load(Ordering::Relaxed) {
+        println!("============================================");
+        println!("     PEER NODE FOUND SOLUTION - exiting     ");
+        println!("============================================\n");
+        println!("Elapsed: {:.2} hours", elapsed_secs / 3600.0);
+        let tried = cd_tried.load(Ordering::Relaxed);
+        let total_checked = cd_total.load(Ordering::Relaxed);
+        println!("CD pairs checked: {:.2e}", total_checked as f64);
+        println!("CD pairs searched (passed spectral): {:.2e}", tried as f64);
+        if let Some(ref flag_path) = found_flag {
+            println!("Found-flag: {}", flag_path);
+        }
     } else if timed_out.load(Ordering::Relaxed) {
         // Timeout: record what we saw, including tuple identity if a single
         // tuple was targeted (--tuple K or --top 1).
