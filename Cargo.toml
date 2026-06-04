@@ -44,3 +44,7 @@ path = "rust_code/find_bs_n44_13_instances.rs"
 [[bin]]
 name = "find_bs_v7_parallel"
 path = "rust_code/find_bs_v7_parallel.rs"
+
+[[bin]]
+name = "find_bs_v8_parallel_per_node"
+path = "rust_code/find_bs_v8_parallel_per_node.rs"
