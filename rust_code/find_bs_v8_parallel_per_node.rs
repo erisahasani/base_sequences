@@ -1390,37 +1390,77 @@ fn enumerate_mod6_ab_solutions(
 }
 
 /// Multi-node CD-tree sharding context. When `claim_dir` is Some and
-/// `shard_depth > 0`, the recursion claims subtrees by atomic file create at
-/// `<claim_dir>/t{tuple_idx}_p{m3m6_pair_idx}_cd{prefix:x}.claimed`. Each
-/// prefix represents a path of pair-choice indices in `backtrack_cd_from_mod6`
-/// taken from depth 0 up to depth `shard_depth-1`. Exactly one node wins the
-/// create per prefix; the rest skip the entire subtree. Sharing happens
-/// BEFORE the spectral filter, so non-owning nodes do zero CD-generation work
-/// on skipped subtrees.
+/// `shard_depth > 0`, the recursion claims subtrees by atomic file create.
+/// File layout for a (tuple, m3m6_pair, claim-depth, prefix):
+///   <claim_dir>/t{T}_p{P}_d{d}_pfx{prefix:x}.claimed   — someone owns it
+///   <claim_dir>/t{T}_p{P}_d{d}_pfx{prefix:x}.done      — fully explored
+///
+/// Two coordination levels are used:
+///   - **Static claim** at depth `shard_depth` (≤16 chunks per m3m6 pair at
+///     depth 1, ≤128 at depth 2). Each node grabs prefixes via O_CREAT|O_EXCL.
+///   - **Cooperative sub-claim** at depth `shard_depth+1` (when `allow_steal`
+///     is true). The owner of a static-depth prefix sub-claims each of its
+///     children before descending; idle peers can race for those children
+///     when their own static work is exhausted. This is what breaks the
+///     long-tail-of-imbalance ceiling that static-only sharding hits.
+///
+/// `force_prefix` / `force_depth` are used by stealers: they enter a specific
+/// sub-prefix path and ignore all sibling branches at depths < `force_depth`.
 #[derive(Clone, Copy)]
 struct ShardCtx<'a> {
     tuple_idx: usize,
     m3m6_pair_idx: usize,
     claim_dir: Option<&'a str>,
     shard_depth: usize,
+    allow_steal: bool,
+    force_prefix: u64,
+    force_depth: usize,
 }
 
 impl<'a> ShardCtx<'a> {
     /// No-shard context: behaves identically to v7 (no FS coordination).
     fn none() -> Self {
-        Self { tuple_idx: 0, m3m6_pair_idx: 0, claim_dir: None, shard_depth: 0 }
+        Self {
+            tuple_idx: 0,
+            m3m6_pair_idx: 0,
+            claim_dir: None,
+            shard_depth: 0,
+            allow_steal: false,
+            force_prefix: 0,
+            force_depth: 0,
+        }
     }
 }
 
-/// Atomic O_CREAT|O_EXCL on a per-prefix sentinel file. Returns true if this
-/// process won the claim (or if no claim_dir is configured).
-fn try_claim_cd_branch(dir: &str, tuple_idx: usize, m3m6_pair_idx: usize, branch_prefix: u64) -> bool {
-    let path = format!("{}/t{}_p{}_cd{:x}.claimed", dir, tuple_idx, m3m6_pair_idx, branch_prefix);
+fn cd_branch_path(dir: &str, tuple_idx: usize, m3m6_pair_idx: usize, depth: usize, branch_prefix: u64, suffix: &str) -> String {
+    format!("{}/t{}_p{}_d{}_pfx{:x}.{}", dir, tuple_idx, m3m6_pair_idx, depth, branch_prefix, suffix)
+}
+
+/// Atomic O_CREAT|O_EXCL on a per-prefix sentinel file. Returns true iff this
+/// process wins the claim. Already-done prefixes refuse the claim — callers
+/// must check `.done` separately to distinguish "done by predecessor" from
+/// "in flight on a peer".
+fn try_claim_cd_branch(dir: &str, tuple_idx: usize, m3m6_pair_idx: usize, depth: usize, branch_prefix: u64) -> bool {
+    let path = cd_branch_path(dir, tuple_idx, m3m6_pair_idx, depth, branch_prefix, "claimed");
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
         .is_ok()
+}
+
+/// Mark a (tuple, m3m6_pair, depth, prefix) subtree as fully explored. Best-
+/// effort: a write failure here is non-fatal — a future job will rerun the
+/// subtree, which is wasteful but correct. Done markers are how resume across
+/// 48h job boundaries stays sound.
+fn mark_cd_branch_done(dir: &str, tuple_idx: usize, m3m6_pair_idx: usize, depth: usize, branch_prefix: u64) {
+    let path = cd_branch_path(dir, tuple_idx, m3m6_pair_idx, depth, branch_prefix, "done");
+    let _ = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&path);
+}
+
+fn is_cd_branch_done(dir: &str, tuple_idx: usize, m3m6_pair_idx: usize, depth: usize, branch_prefix: u64) -> bool {
+    let path = cd_branch_path(dir, tuple_idx, m3m6_pair_idx, depth, branch_prefix, "done");
+    std::path::Path::new(&path).exists()
 }
 
 /// Deterministic backtracking to construct C,D sequences satisfying both
@@ -1704,18 +1744,55 @@ fn backtrack_cd_from_mod6(
             let new_prefix = prefix_so_far
                 .wrapping_mul(16)
                 .wrapping_add(choice_idx as u64);
+            let new_depth = pair_idx + 1;
 
-            // Multi-node sharding: at the deepest configured shard level
-            // (pair_idx + 1 == shard_depth), attempt to claim this prefix.
-            // Skip the entire subtree if another node already owns it.
-            // Shallower depths (pair_idx + 1 < shard_depth) recurse
-            // unconditionally — the claim contention happens once per
-            // top-level prefix path, deeper levels inherit ownership.
+            // Force-prefix filter for stealer entry: when a stealer kicks off
+            // a forced sub-prefix run, the recursion must descend ONLY into
+            // the specified path for the first `force_depth` levels. Beyond
+            // that, normal exploration resumes.
+            if shard.force_depth > 0 && pair_idx < shard.force_depth {
+                let bits_from_top = (shard.force_depth - 1 - pair_idx) * 4;
+                let expected = (shard.force_prefix >> bits_from_top) & 0xF;
+                if (choice_idx as u64) != expected {
+                    continue;
+                }
+            }
+
+            // Track which depth (if any) we claimed at, so we can write the
+            // matching .done marker once the subtree is exhausted.
+            let mut claimed_at_depth: usize = 0;
+
+            // Multi-node sharding (static layer): at depth `shard_depth`,
+            // every (tuple, m3m6_pair, prefix) is owned by exactly one node.
+            // Skip prefixes already marked .done from a prior job; race for
+            // unclaimed ones via O_CREAT|O_EXCL.
             if let Some(dir) = shard.claim_dir {
-                if shard.shard_depth > 0 && pair_idx + 1 == shard.shard_depth {
-                    if !try_claim_cd_branch(dir, shard.tuple_idx, shard.m3m6_pair_idx, new_prefix) {
+                if shard.shard_depth > 0 && new_depth == shard.shard_depth {
+                    if is_cd_branch_done(dir, shard.tuple_idx, shard.m3m6_pair_idx, new_depth, new_prefix) {
                         continue;
                     }
+                    if !try_claim_cd_branch(dir, shard.tuple_idx, shard.m3m6_pair_idx, new_depth, new_prefix) {
+                        continue;
+                    }
+                    claimed_at_depth = new_depth;
+                }
+
+                // Multi-node sharding (cooperative steal layer): one level
+                // inside an owned static prefix, sub-claim each child so
+                // idle peers can race for them. Static-only sharding has a
+                // long-tail load-imbalance ceiling because one node ends up
+                // with the heaviest prefix; this layer breaks that ceiling.
+                if shard.allow_steal
+                    && shard.shard_depth > 0
+                    && new_depth == shard.shard_depth + 1
+                {
+                    if is_cd_branch_done(dir, shard.tuple_idx, shard.m3m6_pair_idx, new_depth, new_prefix) {
+                        continue;
+                    }
+                    if !try_claim_cd_branch(dir, shard.tuple_idx, shard.m3m6_pair_idx, new_depth, new_prefix) {
+                        continue;
+                    }
+                    claimed_at_depth = new_depth;
                 }
             }
 
@@ -1792,6 +1869,13 @@ fn backtrack_cd_from_mod6(
                     d_running[rc] -= dj;
                     filled[lc] -= 1;
                     filled[rc] -= 1;
+                    // Subtree is exhausted (pre-screen rules out every leaf).
+                    // Mark done so a future job won't re-enter this prefix.
+                    if claimed_at_depth > 0 {
+                        if let Some(dir) = shard.claim_dir {
+                            mark_cd_branch_done(dir, shard.tuple_idx, shard.m3m6_pair_idx, claimed_at_depth, new_prefix);
+                        }
+                    }
                     continue;
                 }
 
@@ -2050,6 +2134,15 @@ fn backtrack_cd_from_mod6(
             d_running[rc] -= dj;
             filled[lc] -= 1;
             filled[rc] -= 1;
+            // Normal exit: this iteration's subtree is exhaustively explored
+            // (no solution found, or the only way out is via *stop which
+            // skipped this line). Mark the claim done so future jobs can
+            // resume safely.
+            if claimed_at_depth > 0 {
+                if let Some(dir) = shard.claim_dir {
+                    mark_cd_branch_done(dir, shard.tuple_idx, shard.m3m6_pair_idx, claimed_at_depth, new_prefix);
+                }
+            }
         }
     }
 
@@ -2065,6 +2158,203 @@ fn backtrack_cd_from_mod6(
         spectral_threshold, cd_checked_counter,
         &shard, 0,
     );
+}
+
+/// Recompute the per-shift max-contribution table used by AB backtracking.
+/// Same body as the inline computation in main()'s per-tuple setup — extracted
+/// so steal-mode can recompute it without duplication.
+fn compute_ab_max_contrib(n: usize, ab_constraints: &[Vec<(i32, i32, i32, i32)>]) -> Vec<Vec<i32>> {
+    let m = n + 1;
+    let num_pairs_pre = ab_constraints.len();
+    (0..num_pairs_pre).map(|pidx| {
+        let ready_shift = n - pidx;
+        let uf_lo = pidx + 1;
+        (0..=n).map(|s| {
+            if s == 0 || s >= ready_shift || pidx + 2 > m { return 0; }
+            let uf_hi = m - 2 - pidx;
+            if uf_hi < uf_lo { return 0; }
+            let uf_len = uf_hi - uf_lo + 1;
+            let both_unfilled = if s < uf_len { (uf_len - s) as i32 } else { 0 };
+            let left_lo = std::cmp::max(s, uf_lo);
+            let left_hi = std::cmp::min(s + uf_lo - 1, uf_hi);
+            let left_count = if left_hi >= left_lo { (left_hi - left_lo + 1) as i32 } else { 0 };
+            let right_lo = std::cmp::max(if uf_hi + 1 >= s { uf_hi + 1 - s } else { 0 }, uf_lo);
+            let right_hi = std::cmp::min(if m > s { m - 1 - s } else { 0 }, uf_hi);
+            let right_count = if m > s && right_hi >= right_lo { (right_hi - right_lo + 1) as i32 } else { 0 };
+            2 * (both_unfilled + left_count + right_count)
+        }).collect()
+    }).collect()
+}
+
+/// Scan the shared claim directory for parent prefixes (at the configured
+/// static `shard_depth`) that are claimed but not done. These are the
+/// candidates an idle node will steal sub-prefixes from. Returns parsed
+/// (tuple_idx, m3m6_pair_idx, prefix) triples.
+fn scan_active_parent_claims(dir: &str, shard_depth: usize) -> Vec<(usize, usize, u64)> {
+    let mut result = Vec::new();
+    let depth_token = format!("_d{}_", shard_depth);
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return result,
+    };
+    for entry in entries.flatten() {
+        let name = match entry.file_name().into_string() { Ok(s) => s, Err(_) => continue };
+        if !name.ends_with(".claimed") { continue; }
+        if !name.contains(&depth_token) { continue; }
+        // Format: t{T}_p{P}_d{d}_pfx{B:x}.claimed
+        let core = &name[..name.len() - ".claimed".len()];
+        let parts: Vec<&str> = core.split('_').collect();
+        if parts.len() != 4 { continue; }
+        let t = match parts[0].strip_prefix("t").and_then(|s| s.parse::<usize>().ok()) { Some(v) => v, None => continue };
+        let p = match parts[1].strip_prefix("p").and_then(|s| s.parse::<usize>().ok()) { Some(v) => v, None => continue };
+        let d = match parts[2].strip_prefix("d").and_then(|s| s.parse::<usize>().ok()) { Some(v) => v, None => continue };
+        if d != shard_depth { continue; }
+        let b = match parts[3].strip_prefix("pfx").and_then(|s| u64::from_str_radix(s, 16).ok()) { Some(v) => v, None => continue };
+        if is_cd_branch_done(dir, t, p, shard_depth, b) { continue; }
+        result.push((t, p, b));
+    }
+    result
+}
+
+/// Idle-peer work-stealing scavenger. After this node's static par_iter
+/// completes, run_steal_mode scans for parent prefixes another node is still
+/// working on and tries to claim sub-prefixes (depth `shard_depth + 1`)
+/// within them. This breaks the long-tail load-imbalance ceiling that pure
+/// static sharding has: an idle node can take depth-2 chunks out of a busy
+/// peer's depth-1 prefix.
+///
+/// Returns Some(solution) if a stolen sub-prefix yields a valid base
+/// sequence. Returns None when the scanner sees no work across `max_empty`
+/// consecutive scans separated by a 2s sleep.
+#[allow(clippy::too_many_arguments)]
+fn run_steal_mode(
+    n: usize,
+    sorted: &[(SumTuple, AltSumTuple)],
+    found: &AtomicBool,
+    cd_tried: &AtomicU64,
+    cd_total: &AtomicU64,
+    ab_timeouts: &AtomicU64,
+    backtrack_limit: u64,
+    claim_dir: &str,
+    shard_depth: usize,
+    spectral_margin: f64,
+) -> Option<(BaseSequence, usize, SumTuple, AltSumTuple)> {
+    const RADIX: u64 = 16;
+    const MAX_EMPTY_SCANS: u32 = 3;
+    let steal_depth = shard_depth + 1;
+    let mut empty_scans: u32 = 0;
+
+    // Per-tuple caches to amortize Step 2/3 across consecutive steal tasks on
+    // the same tuple. mod3 + mod6 enumeration is cheap relative to one CD-tree
+    // subtree, but doing it 1000 times across 1000 sub-prefixes adds up.
+    let mut cached_tuple_idx: Option<usize> = None;
+    let mut cached_m3m6: Vec<(Mod3Solution, Mod6CDSolution)> = Vec::new();
+    let mut cached_ab_constraints: Vec<Vec<(i32, i32, i32, i32)>> = Vec::new();
+    let mut cached_ab_max_contrib: Vec<Vec<i32>> = Vec::new();
+
+    loop {
+        if found.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        let candidates = scan_active_parent_claims(claim_dir, shard_depth);
+        if candidates.is_empty() {
+            empty_scans += 1;
+            if empty_scans >= MAX_EMPTY_SCANS { return None; }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            continue;
+        }
+        empty_scans = 0;
+
+        let mut did_any_work = false;
+        for (tuple_idx, m3m6_pair_idx, parent_prefix) in candidates {
+            if found.load(Ordering::Relaxed) { return None; }
+
+            for child_choice_idx in 0..RADIX {
+                if found.load(Ordering::Relaxed) { return None; }
+
+                let child_prefix = parent_prefix.wrapping_mul(RADIX).wrapping_add(child_choice_idx);
+
+                if is_cd_branch_done(claim_dir, tuple_idx, m3m6_pair_idx, steal_depth, child_prefix) {
+                    continue;
+                }
+                if !try_claim_cd_branch(claim_dir, tuple_idx, m3m6_pair_idx, steal_depth, child_prefix) {
+                    continue;
+                }
+
+                did_any_work = true;
+
+                // Lazily re-derive per-tuple state when the tuple changes.
+                if cached_tuple_idx != Some(tuple_idx) {
+                    let (st, at) = &sorted[tuple_idx];
+                    let mod3_sols = collect_mod3_solutions(n, st, at, usize::MAX);
+                    cached_m3m6.clear();
+                    for (m3_idx, mod3_sol) in mod3_sols.iter().enumerate() {
+                        enumerate_mod6_cd_solutions(n, mod3_sol, m3_idx, st, at, &mut |mod6_sol| {
+                            cached_m3m6.push((mod3_sol.clone(), mod6_sol.clone()));
+                            true
+                        });
+                    }
+                    cached_ab_constraints = precompute_symmetric_constraints_ab(n);
+                    cached_ab_max_contrib = compute_ab_max_contrib(n, &cached_ab_constraints);
+                    cached_tuple_idx = Some(tuple_idx);
+                }
+
+                if m3m6_pair_idx >= cached_m3m6.len() {
+                    // Claim file references a pair that doesn't exist for
+                    // this tuple — likely a stale file from a prior version
+                    // with different enumeration order. Skip.
+                    continue;
+                }
+
+                let (st, at) = &sorted[tuple_idx];
+                let (_, mod6_sol) = &cached_m3m6[m3m6_pair_idx];
+                let mod6_sol_clone = mod6_sol.clone();
+                let ab_mod6_sols = enumerate_mod6_ab_solutions(n, st, at, &mod6_sol_clone.p, &mod6_sol_clone.q);
+
+                let shard = ShardCtx {
+                    tuple_idx,
+                    m3m6_pair_idx,
+                    claim_dir: Some(claim_dir),
+                    shard_depth,
+                    // Stealers don't recursively re-steal — their job is to
+                    // exhaust the sub-prefix they just sub-claimed.
+                    allow_steal: false,
+                    force_prefix: child_prefix,
+                    force_depth: steal_depth,
+                };
+
+                let mut local_result: Option<(BaseSequence, usize, SumTuple, AltSumTuple)> = None;
+                backtrack_cd_from_mod6(n, &mod6_sol_clone, spectral_margin, &mut |c, d| {
+                    if found.load(Ordering::Relaxed) { return false; }
+                    cd_tried.fetch_add(1, Ordering::Relaxed);
+                    let (ab_result, nodes) = backtrack_search_ab(n, c, d, st, at, backtrack_limit, &cached_ab_constraints, &cached_ab_max_contrib, &ab_mod6_sols);
+                    if nodes >= backtrack_limit && backtrack_limit != u64::MAX {
+                        ab_timeouts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Some((a, b)) = ab_result {
+                        let base = BaseSequence::new(a, b, Sequence::new(c.to_vec()), Sequence::new(d.to_vec()));
+                        if base.is_valid() {
+                            found.store(true, Ordering::Relaxed);
+                            local_result = Some((base, tuple_idx, st.clone(), at.clone()));
+                            return false;
+                        }
+                    }
+                    true
+                }, cd_total, shard);
+
+                if local_result.is_some() {
+                    return local_result;
+                }
+            }
+        }
+
+        if !did_any_work {
+            empty_scans += 1;
+            if empty_scans >= MAX_EMPTY_SCANS { return None; }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    }
 }
 
 /// Backtracking search for A,B sequences using Theorem 2.2 constraints.
@@ -3646,6 +3936,14 @@ fn main() {
     // the slurm script handles the cleanup once before srun.
     let reset_claims = args.iter().any(|a| a == "--reset-claims");
 
+    // --no-steal: disable the cooperative steal layer. When --claim-dir is
+    // set, the default is to enable stealing (idle nodes pull sub-prefixes
+    // out of busy peers at depth `shard_depth + 1`). Pass --no-steal to fall
+    // back to pure static partitioning (cheaper FS load, hard ceiling on
+    // multi-node speedup from load imbalance — only set if you've measured
+    // and stealing is causing more harm than good).
+    let allow_steal = claim_dir.is_some() && !args.iter().any(|a| a == "--no-steal");
+
     // --found-flag <path>: shared sentinel file. A background thread polls it
     // every 5s; if it appears, sets the in-process `found` flag and the search
     // exits. The solution finder writes the file so peer nodes terminate.
@@ -3741,6 +4039,11 @@ fn main() {
         log_println!("  Claim dir: {} (CD-tree shard, depth {})", dir, shard_depth);
         if reset_claims {
             log_println!("  Reset claims: yes (existing claim files wiped at startup)");
+        }
+        if allow_steal {
+            log_println!("  Steal mode: ON (sub-claims at depth {}; idle peers pull from busy parents)", shard_depth + 1);
+        } else {
+            log_println!("  Steal mode: OFF (pure static partition; --no-steal)");
         }
     }
     if let Some(ref f) = found_flag {
@@ -3992,6 +4295,12 @@ fn main() {
                     m3m6_pair_idx: pair_idx,
                     claim_dir: claim_dir_ref,
                     shard_depth,
+                    // Cooperative sub-claims at shard_depth+1 — lets idle
+                    // peers pull work out of this prefix when their own
+                    // static share is exhausted. Disabled via --no-steal.
+                    allow_steal,
+                    force_prefix: 0,
+                    force_depth: 0,
                 };
 
                 backtrack_cd_from_mod6(n, &mod6_sol, spectral_margin, &mut |c, d| {
@@ -4026,6 +4335,34 @@ fn main() {
             tuples_done.fetch_add(1, Ordering::Relaxed);
             None
         });
+
+    // v8 work-stealing: when our static par_iter exited without a solution
+    // and another node may still be grinding on a claimed parent prefix, look
+    // for stealable sub-prefixes. This is what breaks the long-tail
+    // load-imbalance ceiling that pure static partitioning has. If a peer
+    // already found the solution and tripped `found`, steal mode exits
+    // immediately and `result` stays None as expected.
+    let result = if result.is_none() && allow_steal && !found.load(Ordering::Relaxed) {
+        if let Some(ref dir) = claim_dir {
+            log_println!("Static partition exhausted; entering steal mode (depth {} sub-claims)", shard_depth + 1);
+            run_steal_mode(
+                n,
+                &sorted_arc,
+                &found,
+                &cd_tried,
+                &cd_total,
+                &ab_timeouts,
+                backtrack_limit,
+                dir.as_str(),
+                shard_depth,
+                1e-6,
+            )
+        } else {
+            result
+        }
+    } else {
+        result
+    };
 
     // Stop progress thread
     search_done.store(true, Ordering::Relaxed);
