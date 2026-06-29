@@ -18,33 +18,21 @@ serde_json = "1.0"
 core_affinity = "0.8.3"
 
 [[bin]]
-name = "find_bs_generic_v5"
-path = "rust_code/find_bs_generic_v5.rs"
+name = "find_bs_multi_node"
+path = "rust_code/find_bs_multi_node.rs"
 
 [[bin]]
 name = "find_bs_generic_v6"
 path = "rust_code/find_bs_generic_v6.rs"
 
 [[bin]]
-name = "find_bs_generic_v7"
-path = "rust_code/find_bs_generic_v7.rs"
-
-[[bin]]
-name = "find_bs_v6_evolve1"
-path = "rust_code/find_bs_v6_evolve1.rs"
-
-[[bin]]
 name = "find_bs_v6_parallel"
 path = "rust_code/find_bs_v6_parallel.rs"
-
-[[bin]]
-name = "find_bs_n44_13_instances"
-path = "rust_code/find_bs_n44_13_instances.rs"
 
 [[bin]]
 name = "find_bs_v7_parallel"
 path = "rust_code/find_bs_v7_parallel.rs"
 
 [[bin]]
-name = "find_bs_v8_parallel_per_node"
-path = "rust_code/find_bs_v8_parallel_per_node.rs"
+name = "find_bs_v7_all_tuples"
+path = "rust_code/find_bs_v7_all_tuples.rs"
