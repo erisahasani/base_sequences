@@ -1360,6 +1360,12 @@ static CLAIM_IO_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// CD leaves and report the total (validates partition coverage, measures pass rates).
 static COUNT_ONLY: AtomicBool = AtomicBool::new(false);
 
+/// Global "stop the CD search now" flag. Set by the wall-clock timeout, a peer's
+/// found-flag, or a local solution. The per-leaf callback only observes `found` on
+/// spectrally-valid leaves (~sub-1% of nodes), so a barren subtree would grind past
+/// the deadline; `recurse` checks this at every node entry to unwind promptly.
+static ABORT_SEARCH: AtomicBool = AtomicBool::new(false);
+
 /// Mark a subtree fully explored. Best-effort: a write failure just causes a
 /// future rerun (wasteful but correct). Done markers keep cross-job resume sound.
 fn mark_cd_branch_done(dir: &str, tuple_idx: usize, m3m6_pair_idx: usize, depth: usize, branch_prefix: u64) {
@@ -1563,7 +1569,7 @@ fn backtrack_cd_from_mod6(
         shard: &ShardCtx<'_>,
         prefix_so_far: u64,
     ) {
-        if *stop { return; }
+        if *stop || ABORT_SEARCH.load(Ordering::Relaxed) { *stop = true; return; }
         let na = num_angles;
 
         if pair_idx >= num_pairs {
@@ -3782,6 +3788,7 @@ fn main() {
             if !found_to.load(Ordering::Relaxed) {
                 timed_out_to.store(true, Ordering::Relaxed);
                 found_to.store(true, Ordering::Relaxed);
+                ABORT_SEARCH.store(true, Ordering::Relaxed);
             }
         });
     }
@@ -3800,6 +3807,7 @@ fn main() {
                 if std::path::Path::new(&path).exists() {
                     peer_found_pf.store(true, Ordering::Relaxed);
                     found_pf.store(true, Ordering::Relaxed);
+                    ABORT_SEARCH.store(true, Ordering::Relaxed);
                     break;
                 }
             }
@@ -3869,6 +3877,7 @@ fn main() {
                         let base = BaseSequence::new(a, b, Sequence::new(c.to_vec()), Sequence::new(d.to_vec()));
                         if base.is_valid() {
                             found.store(true, Ordering::Relaxed);
+                            ABORT_SEARCH.store(true, Ordering::Relaxed);
                             local_result = Some((base, tuple_idx, st.clone(), at.clone()));
                             return false;
                         }
