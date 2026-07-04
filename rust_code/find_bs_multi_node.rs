@@ -22,6 +22,11 @@
 ///                       (<=16 claims per (tuple, m3m6_pair)). Must match across nodes.
 ///   --reset-claims      Wipe --claim-dir contents at startup.
 ///   --found-flag <path> Cross-node solution sentinel; polled every 5s.
+///   --coverage-dir <path> Per-rank completion markers; all N => exact-coverage cert.
+///   --checkpoint-dir <path> RESUMABLE partition search. Per rank, an append-only log
+///                       of fully-searched m3xm6-pair indices; on resume those pairs
+///                       are skipped. Requires --partition, a single --tuple, and
+///                       --ab-limit unlimited. Reuse the SAME dir to continue a job.
 ///
 /// 5-step algorithm from Wang & Zhu (2025):
 /// 1. Tuple discovery (Thm 2.1)  2. Mod-3 enum (Thm 2.3, m=3)
@@ -1396,6 +1401,59 @@ fn release_orphan_claims() -> usize {
 fn is_cd_branch_done(dir: &str, tuple_idx: usize, m3m6_pair_idx: usize, depth: usize, branch_prefix: u64) -> bool {
     let path = cd_branch_path(dir, tuple_idx, m3m6_pair_idx, depth, branch_prefix, "done");
     std::path::Path::new(&path).exists()
+}
+
+// ---------------------------------------------------------------------------
+// Partition-mode RESUME checkpointing (m3xm6-pair granularity).
+//
+// Per-CD `.done` markers (claim mode) would explode at scale: n=42 tuple 95 has
+// ~7e5 m3xm6 pairs, each with up to 16^shard_depth CD prefixes -> ~1e9 tiny
+// files. So partition mode checkpoints ONE level up: each rank appends the index
+// of every m3xm6 pair whose *owned* CD-subtree it fully searched (unlimited AB,
+// not interrupted). One compact append-only log per rank. On resume those pairs
+// are skipped; the per-CD partition ownership inside a pair is unchanged, so
+// exact coverage is preserved (union over resume jobs = the full CD tree).
+// ---------------------------------------------------------------------------
+
+/// Per-rank resume-log path. Keyed on (n, tuple, nparts) so a different problem
+/// or partition count uses a different file (a pair index only means the same
+/// pair for a fixed n+tuple; ownership only matches for a fixed nparts).
+fn checkpoint_log_path(dir: &str, n: usize, tuple: usize, nparts: u64, rank: u64) -> String {
+    format!("{}/ckpt_n{}_t{}_N{}_r{}.log", dir, n, tuple, nparts, rank)
+}
+
+/// Load completed m3xm6-pair indices from a rank's resume log. Skips the `#`
+/// header and any torn final line (a hard kill mid-append just drops one index,
+/// which is re-searched — safe). Missing file => empty set (fresh start).
+fn load_completed_pairs(path: &str) -> HashSet<usize> {
+    let mut done = HashSet::new();
+    if let Ok(contents) = std::fs::read_to_string(path) {
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') { continue; }
+            if let Ok(idx) = line.parse::<usize>() { done.insert(idx); }
+        }
+    }
+    done
+}
+
+/// Append the pending batch of newly-completed pair indices to the rank's log.
+/// Best-effort: a failed append just re-searches those pairs on a later resume.
+fn flush_completed_pairs(path: &str, pending: &Mutex<Vec<usize>>) {
+    use std::io::Write;
+    let batch: Vec<usize> = match pending.lock() {
+        Ok(mut g) if !g.is_empty() => std::mem::take(&mut *g),
+        _ => return,
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let mut buf = String::with_capacity(batch.len() * 7);
+        for idx in batch {
+            buf.push_str(&idx.to_string());
+            buf.push('\n');
+        }
+        let _ = f.write_all(buf.as_bytes());
+        let _ = f.flush();
+    }
 }
 
 /// Backtrack to construct C,D satisfying Thm 2.2 paired constraints AND target
@@ -3530,6 +3588,16 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .cloned();
 
+    // --checkpoint-dir <path>: RESUMABLE partition search. Per rank, an
+    // append-only log of m3xm6-pair indices whose owned CD-subtree was fully
+    // searched; on resume those pairs are skipped. Requires --partition, a
+    // single --tuple, and unlimited --ab-limit (a "done" pair must be truly
+    // exhaustive). Reuse the SAME dir across resubmissions to continue.
+    let checkpoint_dir: Option<String> = args.iter()
+        .position(|a| a == "--checkpoint-dir")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+
     // --count-only: enumerate CD tree, report spectral-reaching leaf count (see COUNT_ONLY).
     if args.iter().any(|a| a == "--count-only") {
         COUNT_ONLY.store(true, Ordering::Relaxed);
@@ -3635,12 +3703,28 @@ fn main() {
     if let Some((rank, nparts)) = partition_spec {
         log_println!("  Partition: rank {}/{} (deterministic modulo, CD-tree depth {}; coordination-free, provably exact coverage)", rank, nparts, shard_depth);
     }
+    // Thread-count diagnostic up front: a lone thread means SLURM pinned this task
+    // to 1 core (nproc=1) and the search is single-threaded — catch it immediately,
+    // not 48h later. rayon's pool defaults to std::thread::available_parallelism.
+    let rayon_threads = rayon::current_num_threads();
+    let avail_par = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(0);
+    log_println!("  Threads: rayon pool = {}, available_parallelism = {}", rayon_threads, avail_par);
+    if rayon_threads <= 1 || avail_par <= 1 {
+        log_println!("  WARNING: only 1 core visible — search is SINGLE-THREADED. On SLURM add `-c $SLURM_CPUS_PER_TASK` to srun (or set RAYON_NUM_THREADS).");
+    }
     if let Some(ref dir) = coverage_dir {
         if let Err(e) = std::fs::create_dir_all(dir) {
             eprintln!("Error: failed to create --coverage-dir {}: {}", dir, e);
             std::process::exit(1);
         }
         log_println!("  Coverage dir: {} (per-rank completion markers)", dir);
+    }
+    if let Some(ref dir) = checkpoint_dir {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("Error: failed to create --checkpoint-dir {}: {}", dir, e);
+            std::process::exit(1);
+        }
+        log_println!("  Checkpoint dir: {} (per-rank resume log; reuse across resubmissions to continue)", dir);
     }
     if COUNT_ONLY.load(Ordering::Relaxed) {
         log_println!("  Count-only: ON (full CD enumeration, no AB search)");
@@ -3817,6 +3901,55 @@ fn main() {
     let range_start = effective_range.map(|(s, _)| s).unwrap_or(0);
     let range_end = effective_range.map(|(_, e)| e).unwrap_or(sorted_arc.len());
 
+    // Resume checkpoint setup (partition + single tuple + unlimited AB only).
+    let (checkpoint_enabled, ckpt_path, already_done, ckpt_pending): (
+        bool, String, Arc<HashSet<usize>>, Arc<Mutex<Vec<usize>>>,
+    ) = match (checkpoint_dir.as_ref(), partition_spec) {
+        (Some(dir), Some((rank, nparts)))
+            if backtrack_limit == u64::MAX && range_end == range_start + 1 =>
+        {
+            let path = checkpoint_log_path(dir, n, range_start, nparts, rank);
+            let done = load_completed_pairs(&path);
+            if !done.is_empty() {
+                log_println!(
+                    "Resume: {} m3xm6-pair(s) already completed for partition {}/{} (skipping them) — {}",
+                    done.len(), rank, nparts, path
+                );
+            }
+            // Create with a human header only if absent (never truncate a resume log).
+            if !std::path::Path::new(&path).exists() {
+                if let Ok(mut f) = File::create(&path) {
+                    let _ = writeln!(
+                        f, "# resume log: n={} tuple={} partition={}/{} — completed m3xm6-pair indices follow",
+                        n, range_start, rank, nparts
+                    );
+                }
+            }
+            (true, path, Arc::new(done), Arc::new(Mutex::new(Vec::new())))
+        }
+        (Some(_), _) => {
+            log_println!(
+                "WARNING: --checkpoint-dir ignored — resume requires --partition, a single --tuple, and --ab-limit unlimited"
+            );
+            (false, String::new(), Arc::new(HashSet::new()), Arc::new(Mutex::new(Vec::new())))
+        }
+        _ => (false, String::new(), Arc::new(HashSet::new()), Arc::new(Mutex::new(Vec::new()))),
+    };
+
+    // Periodic flusher: append newly-completed pairs to the resume log every 120s.
+    if checkpoint_enabled {
+        let path = ckpt_path.clone();
+        let pending_f = Arc::clone(&ckpt_pending);
+        let search_done_f = Arc::clone(&search_done);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(120));
+                flush_completed_pairs(&path, &pending_f);
+                if search_done_f.load(Ordering::Relaxed) { break; }
+            }
+        });
+    }
+
     let result: Option<(BaseSequence, usize, SumTuple, AltSumTuple)> = (range_start..range_end)
         .into_par_iter()
         // find_map_any: any solution is valid, less coordination than find_map_first
@@ -3849,6 +3982,8 @@ fn main() {
             let claim_dir_ref = claim_dir.as_deref();
             let result = m3_m6_pairs.into_par_iter().enumerate().find_map_any(|(pair_idx, (_mod3_sol, mod6_sol))| {
                 if found.load(Ordering::Relaxed) { return None; }
+                // Resume: this pair's owned CD-subtree was fully searched in a prior job.
+                if checkpoint_enabled && already_done.contains(&pair_idx) { return None; }
                 let mut local_result: Option<(BaseSequence, usize, SumTuple, AltSumTuple)> = None;
 
                 let ab_mod6_sols = enumerate_mod6_ab_solutions(n, st, at, &mod6_sol.p, &mod6_sol.q);
@@ -3885,6 +4020,16 @@ fn main() {
                     true
                 }, &cd_total, shard);
 
+                // Record this pair as fully searched ONLY if it completed naturally:
+                // no solution here and no global abort (timeout / peer / solution).
+                // An interrupted pair is left unmarked so resume re-searches it.
+                if checkpoint_enabled
+                    && local_result.is_none()
+                    && !ABORT_SEARCH.load(Ordering::Relaxed)
+                {
+                    if let Ok(mut g) = ckpt_pending.lock() { g.push(pair_idx); }
+                }
+
                 local_result
             });
 
@@ -3900,6 +4045,17 @@ fn main() {
 
     search_done.store(true, Ordering::Relaxed);
     std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Final resume-log flush: capture pairs that completed since the last periodic
+    // flush (e.g. just before a timeout) so their work isn't repeated on resume.
+    if checkpoint_enabled {
+        let new_this_run = ckpt_pending.lock().map(|g| g.len()).unwrap_or(0);
+        flush_completed_pairs(&ckpt_path, &ckpt_pending);
+        log_println!(
+            "Resume log updated: +{} m3xm6-pair(s) completed this run, {} total for this rank ({})",
+            new_this_run, already_done.len() + new_this_run, ckpt_path
+        );
+    }
 
     // Release claimed-but-not-done subtrees (early stop) so resume re-explores them.
     // No-op on clean exhaustion (registry already drained). Safe: par_iter returned.
