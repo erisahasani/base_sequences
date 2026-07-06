@@ -65,6 +65,9 @@ BIN=target/release/find_bs_multi_node
   echo "cargo_config_target_cpu: $(grep -E '^[[:space:]]*rustflags' .cargo/config.toml 2>/dev/null | grep -o 'target-cpu=[^\"]*' | head -1 || echo none)"
   echo "avx_fma_mul_ops: $(objdump -d $BIN | grep -cE 'vfmadd|vmulpd|vaddpd')"
   echo "avx512_zmm_refs: $(objdump -d $BIN | grep -cE '%zmm')"
+  echo "git_rev: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  echo "git_dirty_files: $(git status --porcelain 2>/dev/null | wc -l)"
+  echo "algo: H1 intra-node parallel owned-prefix CD seeds (+ M2 feasibility, M3 batched counter, L8 hoisted tables)"
 } > "$LOG_DIR/build_info.txt"
 cat "$LOG_DIR/build_info.txt"
 
@@ -111,10 +114,21 @@ echo "end: $(date -Is)" >> "$LOG_DIR/run_config.txt"
 echo "=== end $(date) ==="
 
 # Roll up the one shareable summary (build/machine/throughput/balance/stability).
-if [ -f rust_code/analyze_perftest.sh ]; then
-  bash rust_code/analyze_perftest.sh "$LOG_DIR" || true
-elif [ -f analyze_perftest.sh ]; then
+# analyze_perftest.sh lives in the repo main dir (we cd'd into base_sequences).
+if [ -f analyze_perftest.sh ]; then
   bash analyze_perftest.sh "$LOG_DIR" || true
+else
+  echo "NOTE: analyze_perftest.sh not found in $(pwd); summary not generated. Logs in $LOG_DIR"
+fi
+
+# Bundle EVERYTHING (summary + per-node .out/.log + machine/build/run info) into one
+# archive so the whole run can be pulled back with a single scp of TARBALL.
+TARBALL=$SCRATCH/perftest_${TAG}_${SLURM_JOB_ID}.tar.gz
+if tar -czf "$TARBALL" -C "$(dirname "$LOG_DIR")" "$(basename "$LOG_DIR")" 2>/dev/null; then
+  echo "BRING-BACK TARBALL: $TARBALL  ($(du -h "$TARBALL" | cut -f1))"
+  echo "  retrieve with:  scp ls6:$TARBALL ."
+else
+  echo "NOTE: could not create bring-back tarball; logs remain in $LOG_DIR"
 fi
 
 # ---- verdict ----

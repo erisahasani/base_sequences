@@ -668,13 +668,18 @@ fn collect_mod6_cd_solutions(n: usize, mod3_sol: &Mod3Solution, mod3_idx: usize,
 }
 
 fn collect_cd_from_mod6(n: usize, mod6_sol: &Mod6CDSolution, spectral_margin: f64, max: usize) -> (Vec<(Sequence, Sequence)>, u64) {
-    let mut results = Vec::new();
+    // Debug/stats helper (serial, ShardCtx::none). The predicate is now Fn + Sync, so
+    // results go through a Mutex rather than a captured &mut Vec.
+    let results = Mutex::new(Vec::new());
     let counter = AtomicU64::new(0);
-    backtrack_cd_from_mod6(n, mod6_sol, spectral_margin, &mut |c, d| {
-        results.push((Sequence::new(c.to_vec()), Sequence::new(d.to_vec())));
-        results.len() < max
-    }, &counter, ShardCtx::none());
-    (results, counter.load(Ordering::Relaxed))
+    let precomp = CdPrecomp::new(n);
+    let predicate = |c: &[i32], d: &[i32]| -> bool {
+        let mut r = results.lock().unwrap();
+        r.push((Sequence::new(c.to_vec()), Sequence::new(d.to_vec())));
+        r.len() < max
+    };
+    backtrack_cd_from_mod6(n, mod6_sol, spectral_margin, &precomp, &predicate, &counter, ShardCtx::none());
+    (results.into_inner().unwrap(), counter.load(Ordering::Relaxed))
 }
 
 /// Enumerate valid mod-3 partial sum solutions for a tuple (Step 2).
@@ -1456,20 +1461,128 @@ fn flush_completed_pairs(path: &str, pending: &Mutex<Vec<usize>>) {
     }
 }
 
+/// CD-search tables that depend ONLY on `n` (not on the mod-6 target), computed
+/// once per run and shared read-only across every m3xm6 pair and every parallel
+/// CD-subtree worker. Hoisting these out of `backtrack_cd_from_mod6` removes a
+/// ~134KB alloc + retrig on every one of the ~7e5 pairs (audit finding L8).
+struct CdPrecomp {
+    n: usize,
+    num_pairs: usize,
+    num_angles: usize,
+    pair_positions: Vec<(usize, usize, usize, usize)>,
+    c_total: [usize; 6],
+    has_middle: bool,
+    mid_pos: usize,
+    mid_class: usize,
+    trig_cos: Vec<f64>,
+    trig_sin: Vec<f64>,
+    // Per-pair sum/diff trig tables, flat [pair_idx*na + k].
+    pair_pcos: Vec<f64>,
+    pair_mcos: Vec<f64>,
+    pair_psin: Vec<f64>,
+    pair_msin: Vec<f64>,
+}
+
+impl CdPrecomp {
+    fn new(n: usize) -> Self {
+        let m = 6usize;
+        let num_angles = NUM_SPECTRAL_ANGLES;
+
+        // (pos_left, pos_right, class_left, class_right)
+        let mut pair_positions: Vec<(usize, usize, usize, usize)> = Vec::new();
+        if n >= 2 {
+            pair_positions.push((0, n - 1, 0 % m, (n - 1) % m));
+        }
+        for i_0 in 1..(n / 2) {
+            let j_0 = n - 1 - i_0;
+            if i_0 >= j_0 { break; }
+            pair_positions.push((i_0, j_0, i_0 % m, j_0 % m));
+        }
+
+        let has_middle = n % 2 == 1;
+        let mid_pos = n / 2;
+        let mid_class = mid_pos % m;
+
+        let mut c_total = [0usize; 6];
+        for pos in 0..n {
+            c_total[pos % m] += 1;
+        }
+
+        // Sort pairs by min class size for tighter pruning (keep index 0 first)
+        if pair_positions.len() > 1 {
+            let mut indices: Vec<usize> = (1..pair_positions.len()).collect();
+            indices.sort_by_key(|&i| {
+                let (_, _, lc, rc) = pair_positions[i];
+                std::cmp::min(c_total[lc], c_total[rc])
+            });
+            let old_positions = pair_positions.clone();
+            for (new_idx, &old_idx) in indices.iter().enumerate() {
+                pair_positions[new_idx + 1] = old_positions[old_idx];
+            }
+        }
+        let num_pairs = pair_positions.len();
+
+        // Trig tables for incremental spectral check (flat [pos*na + k]).
+        let angle_denom = NUM_SPECTRAL_ANGLES as f64;
+        let trig_cos: Vec<f64> = (0..n).flat_map(|pos| {
+            (0..num_angles).map(move |k| ((pos as f64) * ((k + 1) as f64) * PI / angle_denom).cos())
+        }).collect();
+        let trig_sin: Vec<f64> = (0..n).flat_map(|pos| {
+            (0..num_angles).map(move |k| ((pos as f64) * ((k + 1) as f64) * PI / angle_denom).sin())
+        }).collect();
+
+        // Per-pair sum/diff trig tables (p=cos(left)+cos(right), m=cos(left)-cos(right)).
+        let mut pair_pcos = vec![0.0f64; num_pairs * num_angles];
+        let mut pair_mcos = vec![0.0f64; num_pairs * num_angles];
+        let mut pair_psin = vec![0.0f64; num_pairs * num_angles];
+        let mut pair_msin = vec![0.0f64; num_pairs * num_angles];
+        for (pi, &(left, right, _lc, _rc)) in pair_positions.iter().enumerate() {
+            let lo = left * num_angles;
+            let ro = right * num_angles;
+            let base = pi * num_angles;
+            for k in 0..num_angles {
+                let cl = trig_cos[lo + k];
+                let cr = trig_cos[ro + k];
+                let sl = trig_sin[lo + k];
+                let sr = trig_sin[ro + k];
+                pair_pcos[base + k] = cl + cr;
+                pair_mcos[base + k] = cl - cr;
+                pair_psin[base + k] = sl + sr;
+                pair_msin[base + k] = sl - sr;
+            }
+        }
+
+        CdPrecomp {
+            n, num_pairs, num_angles, pair_positions, c_total,
+            has_middle, mid_pos, mid_class,
+            trig_cos, trig_sin, pair_pcos, pair_mcos, pair_psin, pair_msin,
+        }
+    }
+}
+
 /// Backtrack to construct C,D satisfying Thm 2.2 paired constraints AND target
 /// mod-6 partials, with incremental Hall-polynomial spectral filtering. Calls
-/// `callback` per spectrally-valid CD pair (false stops). Counts CDs reaching the
-/// spectral check. When `shard.claim_dir`/partition set, the top `shard_depth`
-/// pair levels are sharded across nodes.
-fn backtrack_cd_from_mod6(
+/// `predicate` per spectrally-valid CD pair (false stops). Counts CDs reaching the
+/// spectral check.
+///
+/// Parallelism (audit finding H1): in `--partition` mode the owned depth-`shard_depth`
+/// CD-tree prefixes are the rayon work unit, so a single heavy m3xm6 pair is split
+/// across all threads instead of pinning one. A serial pass collects the owned+feasible
+/// prefixes (cheap: `shard_depth` levels), then each is searched in parallel with its
+/// own state, replaying the prefix's forced choices before branching freely. Non-partition
+/// / claim-dir modes keep the original single serial DFS.
+fn backtrack_cd_from_mod6<F>(
     n: usize,
     mod6_sol: &Mod6CDSolution,
     spectral_margin: f64,
-    callback: &mut dyn FnMut(&[i32], &[i32]) -> bool,
+    precomp: &CdPrecomp,
+    predicate: &F,
     cd_checked_counter: &AtomicU64,
     shard: ShardCtx<'_>,
-) {
-    let m = 6usize;
+) where
+    F: Fn(&[i32], &[i32]) -> bool + Sync,
+{
+    debug_assert_eq!(precomp.n, n, "CdPrecomp built for a different n");
     let valid_pairs_cd = valid_symmetric_pairs_cd(); // 8 valid choices
 
     // When C,D interchangeable (equal mod-6 targets), break symmetry: (c0,c_{n-1}) <= (d0,d_{n-1})
@@ -1493,106 +1606,39 @@ fn backtrack_cd_from_mod6(
         v
     };
 
-    // (pos_left, pos_right, class_left, class_right)
-    let mut pair_positions: Vec<(usize, usize, usize, usize)> = Vec::new();
-
-    // Pair (0, n-1): no Thm 2.2 constraint (i=1; applies only i>=2)
-    if n >= 2 {
-        pair_positions.push((0, n - 1, 0 % m, (n - 1) % m));
-    }
-
-    // Constrained pairs (1,n-2),(2,n-3),... while left<right
-    for i_0 in 1..(n / 2) {
-        let j_0 = n - 1 - i_0;
-        if i_0 >= j_0 { break; }
-        pair_positions.push((i_0, j_0, i_0 % m, j_0 % m));
-    }
-
-    // Middle position (odd n)
-    let has_middle = n % 2 == 1;
-    let mid_pos = n / 2;
-    let mid_class = mid_pos % m;
-
-    let mut c_total = [0usize; 6];
-    for pos in 0..n {
-        c_total[pos % m] += 1;
-    }
-
-    // Sort pairs by min class size for tighter pruning (keep index 0 first)
-    if pair_positions.len() > 1 {
-        let mut indices: Vec<usize> = (1..pair_positions.len()).collect();
-        indices.sort_by_key(|&i| {
-            let (_, _, lc, rc) = pair_positions[i];
-            std::cmp::min(c_total[lc], c_total[rc])
-        });
-        let old_positions = pair_positions.clone();
-        for (new_idx, &old_idx) in indices.iter().enumerate() {
-            pair_positions[new_idx + 1] = old_positions[old_idx];
-        }
-    }
+    // n-only tables from precomp (shared read-only across pairs and parallel workers).
+    let num_pairs = precomp.num_pairs;
+    let num_angles = precomp.num_angles;
+    let pair_positions = &precomp.pair_positions[..];
+    let c_total = &precomp.c_total;
+    let has_middle = precomp.has_middle;
+    let mid_pos = precomp.mid_pos;
+    let mid_class = precomp.mid_class;
+    let trig_cos = &precomp.trig_cos[..];
+    let trig_sin = &precomp.trig_sin[..];
+    let pair_pcos = &precomp.pair_pcos[..];
+    let pair_mcos = &precomp.pair_mcos[..];
+    let pair_psin = &precomp.pair_psin[..];
+    let pair_msin = &precomp.pair_msin[..];
 
     let target_p = mod6_sol.p;
     let target_q = mod6_sol.q;
-
-    let mut stop = false;
-    let mut c_vals = vec![0i32; n];
-    let mut d_vals = vec![0i32; n];
-    let mut c_running = [0i32; 6];
-    let mut d_running = [0i32; 6];
-    let mut filled = [0usize; 6];
-    let num_pairs = pair_positions.len();
-
-    // Trig tables for incremental spectral check; hoisted via OnceLock (n fixed per run).
-    static SPECTRAL_TRIG: std::sync::OnceLock<(usize, Vec<f64>, Vec<f64>)> = std::sync::OnceLock::new();
-    let num_angles: usize = NUM_SPECTRAL_ANGLES;
     let spectral_threshold = 4.0 * (n as f64) + 2.0 + spectral_margin;
-    let angle_denom = NUM_SPECTRAL_ANGLES as f64;
-    let trig_pair = SPECTRAL_TRIG.get_or_init(|| {
-        let trig_cos: Vec<f64> = (0..n).flat_map(|pos| {
-            (0..num_angles).map(move |k| {
-                ((pos as f64) * ((k + 1) as f64) * PI / angle_denom).cos()
-            })
-        }).collect();
-        let trig_sin: Vec<f64> = (0..n).flat_map(|pos| {
-            (0..num_angles).map(move |k| {
-                ((pos as f64) * ((k + 1) as f64) * PI / angle_denom).sin()
-            })
-        }).collect();
-        (n, trig_cos, trig_sin)
-    });
-    debug_assert_eq!(trig_pair.0, n, "OnceLock initialized with different n");
-    let trig_cos = &trig_pair.1[..];
-    let trig_sin = &trig_pair.2[..];
 
-    // Per-pair sum/diff trig tables (p=cos(left)+cos(right), m=cos(left)-cos(right)),
-    // precomputed once per pair_idx (flat [pair_idx*na+k]) to avoid per-node memset.
-    let mut pair_pcos = vec![0.0f64; num_pairs * num_angles];
-    let mut pair_mcos = vec![0.0f64; num_pairs * num_angles];
-    let mut pair_psin = vec![0.0f64; num_pairs * num_angles];
-    let mut pair_msin = vec![0.0f64; num_pairs * num_angles];
-    for (pi, &(left, right, _lc, _rc)) in pair_positions.iter().enumerate() {
-        let lo = left * num_angles;
-        let ro = right * num_angles;
-        let base = pi * num_angles;
-        for k in 0..num_angles {
-            let cl = trig_cos[lo + k];
-            let cr = trig_cos[ro + k];
-            let sl = trig_sin[lo + k];
-            let sr = trig_sin[ro + k];
-            pair_pcos[base + k] = cl + cr;
-            pair_mcos[base + k] = cl - cr;
-            pair_psin[base + k] = sl + sr;
-            pair_msin[base + k] = sl - sr;
-        }
+    // Root mod-6 feasibility (audit M2): a class's bound+parity condition is invariant
+    // under placement except when that class is the one being filled, so verifying all 6
+    // here once lets `recurse` re-check only the two just-touched classes per step. If any
+    // class is infeasible from the start, no CD can complete this mod-6 target.
+    for cls in 0..6 {
+        let remaining = c_total[cls] as i32;
+        let cn = target_p[cls];
+        let dn = target_q[cls];
+        if cn.unsigned_abs() as usize > c_total[cls] || (cn + remaining) % 2 != 0 { return; }
+        if dn.unsigned_abs() as usize > c_total[cls] || (dn + remaining) % 2 != 0 { return; }
     }
 
-    // Running Hall polynomial state: Re/Im of C, D per angle
-    let mut real_c = vec![0.0f64; num_angles];
-    let mut imag_c = vec![0.0f64; num_angles];
-    let mut real_d = vec![0.0f64; num_angles];
-    let mut imag_d = vec![0.0f64; num_angles];
     #[allow(clippy::too_many_arguments)]
-    fn recurse(
+    fn recurse<F: Fn(&[i32], &[i32]) -> bool>(
         pair_idx: usize,
         num_pairs: usize,
         pair_positions: &[(usize, usize, usize, usize)],
@@ -1609,7 +1655,7 @@ fn backtrack_cd_from_mod6(
         has_middle: bool,
         mid_pos: usize,
         mid_class: usize,
-        callback: &mut dyn FnMut(&[i32], &[i32]) -> bool,
+        predicate: &F,
         stop: &mut bool,
         trig_cos: &[f64],
         trig_sin: &[f64],
@@ -1624,8 +1670,16 @@ fn backtrack_cd_from_mod6(
         imag_d: &mut [f64],
         spectral_threshold: f64,
         cd_checked: &AtomicU64,
+        local_checked: &mut u64,
         shard: &ShardCtx<'_>,
         prefix_so_far: u64,
+        // H1: forced-prefix replay (pair_idx < forced_depth => follow the seed's
+        // encoded choice; ownership/claim/collect are skipped on those levels) and
+        // seed collection (Some => at the shard_depth boundary, record owned prefixes
+        // and do not descend, instead of searching serially).
+        forced_prefix: u64,
+        forced_depth: usize,
+        collect: Option<&mut Vec<u64>>,
     ) {
         if *stop || ABORT_SEARCH.load(Ordering::Relaxed) { *stop = true; return; }
         let na = num_angles;
@@ -1656,7 +1710,13 @@ fn backtrack_cd_from_mod6(
                                 imag_d[k] += dm_f * s;
                             }
 
-                            cd_checked.fetch_add(1, Ordering::Relaxed);
+                            // M3: batch the per-leaf counter in a thread-local; flush
+                            // to the shared atomic every 4096 to avoid cache-line churn.
+                            *local_checked += 1;
+                            if *local_checked >= 4096 {
+                                cd_checked.fetch_add(*local_checked, Ordering::Relaxed);
+                                *local_checked = 0;
+                            }
                             let mut spectral_ok = true;
                             for k in 0..na {
                                 let fc = real_c[k] * real_c[k] + imag_c[k] * imag_c[k];
@@ -1670,7 +1730,7 @@ fn backtrack_cd_from_mod6(
                             if spectral_ok {
                                 c_vals[mid_pos] = cm;
                                 d_vals[mid_pos] = dm;
-                                if !callback(c_vals, d_vals) { *stop = true; }
+                                if !predicate(c_vals, d_vals) { *stop = true; }
                             }
 
                             // Undo middle spectral update
@@ -1695,7 +1755,11 @@ fn backtrack_cd_from_mod6(
                     }
                 }
                 if sums_ok {
-                    cd_checked.fetch_add(1, Ordering::Relaxed);
+                    *local_checked += 1;
+                    if *local_checked >= 4096 {
+                        cd_checked.fetch_add(*local_checked, Ordering::Relaxed);
+                        *local_checked = 0;
+                    }
                     let mut spectral_ok = true;
                     for k in 0..na {
                         let fc = real_c[k] * real_c[k] + imag_c[k] * imag_c[k];
@@ -1706,7 +1770,7 @@ fn backtrack_cd_from_mod6(
                         }
                     }
                     if spectral_ok {
-                        if !callback(c_vals, d_vals) { *stop = true; }
+                        if !predicate(c_vals, d_vals) { *stop = true; }
                     }
                 }
             }
@@ -1723,7 +1787,18 @@ fn backtrack_cd_from_mod6(
         let p_sin = &pair_psin[base..base + na];
         let m_sin = &pair_msin[base..base + na];
 
+        // H1: while replaying a collected seed (pair_idx < forced_depth) follow only the
+        // seed's encoded choice at this level; ownership/claim/collect are skipped there
+        // because the prefix is already owned by construction.
+        let replaying = pair_idx < forced_depth;
+        let forced_choice = if replaying {
+            ((forced_prefix >> (4 * (forced_depth - 1 - pair_idx))) & 0xF) as usize
+        } else { usize::MAX };
+        let mut collect = collect;
+
         for (choice_idx, &(ci, di, cj, dj)) in choices.iter().enumerate() {
+            if replaying && choice_idx != forced_choice { continue; }
+
             // CD-tree shard prefix: radix-16 u64 encoding (max 16 choices/pair), injective.
             let new_prefix = prefix_so_far
                 .wrapping_mul(16)
@@ -1733,25 +1808,33 @@ fn backtrack_cd_from_mod6(
             // Depth claimed at (0 = none), for the matching .done marker.
             let mut claimed_at_depth: usize = 0;
 
-            // Modulo partition: at shard_depth, own prefix iff hash maps to our rank.
-            if let Some((rank, nparts)) = shard.partition {
-                if shard.shard_depth > 0 && new_depth == shard.shard_depth {
-                    if partition_owner(shard.tuple_idx, shard.m3m6_pair_idx, new_prefix, nparts) != rank {
-                        continue;
+            if !replaying {
+                // Modulo partition: at shard_depth, own prefix iff hash maps to our rank.
+                if let Some((rank, nparts)) = shard.partition {
+                    if shard.shard_depth > 0 && new_depth == shard.shard_depth {
+                        if partition_owner(shard.tuple_idx, shard.m3m6_pair_idx, new_prefix, nparts) != rank {
+                            continue;
+                        }
+                        // H1 seed collection: record this owned prefix and do NOT descend
+                        // serially; a parallel worker will search it (via forced replay).
+                        if let Some(seeds) = collect.as_deref_mut() {
+                            seeds.push(new_prefix);
+                            continue;
+                        }
                     }
                 }
-            }
 
-            // Claim sharding: at shard_depth, skip .done prefixes, race for the rest via O_CREAT|O_EXCL.
-            if let Some(dir) = shard.claim_dir {
-                if shard.shard_depth > 0 && new_depth == shard.shard_depth {
-                    if is_cd_branch_done(dir, shard.tuple_idx, shard.m3m6_pair_idx, new_depth, new_prefix) {
-                        continue;
+                // Claim sharding: at shard_depth, skip .done prefixes, race for the rest via O_CREAT|O_EXCL.
+                if let Some(dir) = shard.claim_dir {
+                    if shard.shard_depth > 0 && new_depth == shard.shard_depth {
+                        if is_cd_branch_done(dir, shard.tuple_idx, shard.m3m6_pair_idx, new_depth, new_prefix) {
+                            continue;
+                        }
+                        if !try_claim_cd_branch(dir, shard.tuple_idx, shard.m3m6_pair_idx, new_depth, new_prefix) {
+                            continue;
+                        }
+                        claimed_at_depth = new_depth;
                     }
-                    if !try_claim_cd_branch(dir, shard.tuple_idx, shard.m3m6_pair_idx, new_depth, new_prefix) {
-                        continue;
-                    }
-                    claimed_at_depth = new_depth;
                 }
             }
 
@@ -1762,9 +1845,13 @@ fn backtrack_cd_from_mod6(
             filled[lc] += 1;
             filled[rc] += 1;
 
-            // mod-6 partial-sum feasibility
+            // mod-6 partial-sum feasibility (audit M2): only lc and rc changed since the
+            // parent's check; every other class keeps its parent-verified state (bound and
+            // parity are invariant under placement of other classes), and the root check in
+            // the caller established all 6 initially. So checking these two is equivalent to
+            // the full 0..6 scan at 1/3 the work on this hottest rejection path.
             let mut feasible = true;
-            for cls in 0..6 {
+            for &cls in &[lc, rc] {
                 let remaining = c_total[cls] - filled[cls];
                 let c_need = target_p[cls] - c_running[cls];
                 let d_need = target_q[cls] - d_running[cls];
@@ -1999,12 +2086,13 @@ fn backtrack_cd_from_mod6(
                         c_vals, d_vals, c_running, d_running, filled,
                         c_total, target_p, target_q,
                         has_middle, mid_pos, mid_class,
-                        callback, stop,
+                        predicate, stop,
                         trig_cos, trig_sin, num_angles,
                         pair_pcos, pair_mcos, pair_psin, pair_msin,
                         real_c, imag_c, real_d, imag_d,
-                        spectral_threshold, cd_checked,
+                        spectral_threshold, cd_checked, local_checked,
                         shard, new_prefix,
+                        forced_prefix, forced_depth, collect.as_deref_mut(),
                     );
                 }
 
@@ -2078,19 +2166,87 @@ fn backtrack_cd_from_mod6(
         }
     }
 
-    recurse(
-        0, num_pairs, &pair_positions,
-        &valid_pairs_cd, &all_16,
-        &mut c_vals, &mut d_vals, &mut c_running, &mut d_running, &mut filled,
-        &c_total, &target_p, &target_q,
-        has_middle, mid_pos, mid_class,
-        callback, &mut stop,
-        &trig_cos, &trig_sin, num_angles,
-        &pair_pcos, &pair_mcos, &pair_psin, &pair_msin,
-        &mut real_c, &mut imag_c, &mut real_d, &mut imag_d,
-        spectral_threshold, cd_checked_counter,
-        &shard, 0,
-    );
+    // One CD-subtree search with fresh per-worker state. `forced_depth==0` => full
+    // serial DFS from the root; `forced_depth>0` => replay the seed's prefix then branch.
+    // Returns true if the search was stopped by a solution / global abort.
+    let run_from = |forced_prefix: u64, forced_depth: usize| -> bool {
+        let mut c_vals = vec![0i32; n];
+        let mut d_vals = vec![0i32; n];
+        let mut c_running = [0i32; 6];
+        let mut d_running = [0i32; 6];
+        let mut filled = [0usize; 6];
+        let mut real_c = vec![0.0f64; num_angles];
+        let mut imag_c = vec![0.0f64; num_angles];
+        let mut real_d = vec![0.0f64; num_angles];
+        let mut imag_d = vec![0.0f64; num_angles];
+        let mut stop = false;
+        let mut local_checked = 0u64;
+        recurse(
+            0, num_pairs, pair_positions,
+            &valid_pairs_cd, &all_16,
+            &mut c_vals, &mut d_vals, &mut c_running, &mut d_running, &mut filled,
+            c_total, &target_p, &target_q,
+            has_middle, mid_pos, mid_class,
+            predicate, &mut stop,
+            trig_cos, trig_sin, num_angles,
+            pair_pcos, pair_mcos, pair_psin, pair_msin,
+            &mut real_c, &mut imag_c, &mut real_d, &mut imag_d,
+            spectral_threshold, cd_checked_counter, &mut local_checked,
+            &shard, 0,
+            forced_prefix, forced_depth, None,
+        );
+        cd_checked_counter.fetch_add(local_checked, Ordering::Relaxed);
+        stop
+    };
+
+    // H1: in partition mode, parallelize over this rank's owned depth-`shard_depth`
+    // CD prefixes so one heavy m3xm6 pair is split across all threads. Requires a real
+    // partition boundary (1 <= shard_depth <= num_pairs); otherwise fall back to serial.
+    let can_parallel = shard.partition.is_some()
+        && shard.shard_depth >= 1
+        && shard.shard_depth <= num_pairs;
+
+    if can_parallel {
+        // Serial pass: collect owned prefixes, pruning shallow dead branches en route.
+        let mut seeds: Vec<u64> = Vec::new();
+        {
+            let mut c_vals = vec![0i32; n];
+            let mut d_vals = vec![0i32; n];
+            let mut c_running = [0i32; 6];
+            let mut d_running = [0i32; 6];
+            let mut filled = [0usize; 6];
+            let mut real_c = vec![0.0f64; num_angles];
+            let mut imag_c = vec![0.0f64; num_angles];
+            let mut real_d = vec![0.0f64; num_angles];
+            let mut imag_d = vec![0.0f64; num_angles];
+            let mut stop = false;
+            let mut local_checked = 0u64;
+            recurse(
+                0, num_pairs, pair_positions,
+                &valid_pairs_cd, &all_16,
+                &mut c_vals, &mut d_vals, &mut c_running, &mut d_running, &mut filled,
+                c_total, &target_p, &target_q,
+                has_middle, mid_pos, mid_class,
+                predicate, &mut stop,
+                trig_cos, trig_sin, num_angles,
+                pair_pcos, pair_mcos, pair_psin, pair_msin,
+                &mut real_c, &mut imag_c, &mut real_d, &mut imag_d,
+                spectral_threshold, cd_checked_counter, &mut local_checked,
+                &shard, 0,
+                0, 0, Some(&mut seeds),
+            );
+            cd_checked_counter.fetch_add(local_checked, Ordering::Relaxed);
+        }
+        // Parallel pass: each owned prefix is an independent subtree. find_map_any
+        // short-circuits once any worker's search is stopped (solution / abort).
+        let _ = seeds.into_par_iter().find_map_any(|seed| {
+            if ABORT_SEARCH.load(Ordering::Relaxed) { return Some(()); }
+            if run_from(seed, shard.shard_depth) { Some(()) } else { None }
+        });
+    } else {
+        // Serial fallback: no partition, claim-dir mode, or shard_depth out of range.
+        run_from(0, 0);
+    }
 }
 
 /// Per-shift max-contribution table used by AB backtracking. Shared by the main
@@ -3950,6 +4106,11 @@ fn main() {
         });
     }
 
+    // n-only CD-search tables (audit L8): built once, shared read-only by every tuple,
+    // m3xm6 pair, and parallel CD-subtree worker.
+    let precomp = CdPrecomp::new(n);
+    let precomp = &precomp;
+
     let result: Option<(BaseSequence, usize, SumTuple, AltSumTuple)> = (range_start..range_end)
         .into_par_iter()
         // find_map_any: any solution is valid, less coordination than find_map_first
@@ -3984,7 +4145,6 @@ fn main() {
                 if found.load(Ordering::Relaxed) { return None; }
                 // Resume: this pair's owned CD-subtree was fully searched in a prior job.
                 if checkpoint_enabled && already_done.contains(&pair_idx) { return None; }
-                let mut local_result: Option<(BaseSequence, usize, SumTuple, AltSumTuple)> = None;
 
                 let ab_mod6_sols = enumerate_mod6_ab_solutions(n, st, at, &mod6_sol.p, &mod6_sol.q);
 
@@ -3997,7 +4157,12 @@ fn main() {
                     partition: partition_spec,
                 };
 
-                backtrack_cd_from_mod6(n, &mod6_sol, spectral_margin, &mut |c, d| {
+                // H1: this pair's owned CD-subtrees are now searched in parallel, so the
+                // solution predicate runs on many threads at once — it must be Fn + Sync and
+                // publish the winning solution through a shared cell, not a captured &mut.
+                let pair_result: Mutex<Option<(BaseSequence, usize, SumTuple, AltSumTuple)>> =
+                    Mutex::new(None);
+                let predicate = |c: &[i32], d: &[i32]| -> bool {
                     if found.load(Ordering::Relaxed) { return false; }
 
                     cd_tried.fetch_add(1, Ordering::Relaxed);
@@ -4013,12 +4178,14 @@ fn main() {
                         if base.is_valid() {
                             found.store(true, Ordering::Relaxed);
                             ABORT_SEARCH.store(true, Ordering::Relaxed);
-                            local_result = Some((base, tuple_idx, st.clone(), at.clone()));
+                            *pair_result.lock().unwrap() = Some((base, tuple_idx, st.clone(), at.clone()));
                             return false;
                         }
                     }
                     true
-                }, &cd_total, shard);
+                };
+                backtrack_cd_from_mod6(n, &mod6_sol, spectral_margin, precomp, &predicate, &cd_total, shard);
+                let local_result = pair_result.into_inner().unwrap();
 
                 // Record this pair as fully searched ONLY if it completed naturally:
                 // no solution here and no global abort (timeout / peer / solution).
@@ -4173,6 +4340,10 @@ fn main() {
         let timeout_rate = if tried > 0 { timeouts as f64 / tried as f64 * 100.0 } else { 0.0 };
         println!("CD pairs checked: {:.2e} ({:.1}% passed spectral)", total_checked as f64, pass_rate);
         println!("CD pairs searched (passed spectral): {:.2e}", tried as f64);
+        // Exact machine-parseable counts (rounded values above lose precision needed
+        // for cross-run equivalence checks and for summing partition ranks).
+        println!("PERF cd_checked: {}", total_checked);
+        println!("PERF cd_searched: {}", tried);
         println!("AB timeouts: {} ({:.1}% of searched)", timeouts, timeout_rate);
         if backtrack_limit == u64::MAX {
             println!("\nNote: Unlimited AB backtracking. If no solution found,");
