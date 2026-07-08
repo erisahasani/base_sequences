@@ -44,6 +44,51 @@ use std::sync::{Mutex, OnceLock};
 // progress lines are written once per hour rather than every 30s.
 static LOG_FILE: OnceLock<Mutex<File>> = OnceLock::new();
 
+// Optional per-CD-pair AB-search timing log (set via --ab-stats <path>). When
+// enabled, every spectral-passing CD pair records one CSV row
+// `tuple,pair,cd_idx,nodes,elapsed_ns,found` measuring how long the AB
+// backtracking search took to FINISH for that fixed CD pair. Every swept CD pair
+// is logged; the search stops at the first valid solution (recording its row
+// first), just like normal mode.
+static AB_STATS: OnceLock<Mutex<BufWriter<File>>> = OnceLock::new();
+// Only CSV-log found=0 rows whose node count is >= this (found=1 rows always
+// logged). Lets a long broad "find the longest AB" hunt keep only the tail
+// instead of writing every trivially-pruned pair. Set via --ab-stats-min-nodes.
+static AB_STATS_MIN_NODES: AtomicU64 = AtomicU64::new(0);
+// Running global max node count over ALL AB searches (updated regardless of the
+// CSV threshold) so the champion is never missed; printed in the run summary.
+static AB_MAX_NODES: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn ab_stats_enabled() -> bool {
+    AB_STATS.get().is_some()
+}
+
+fn ab_stats_record(tuple_idx: usize, pair_idx: usize, cd_idx: usize, nodes: u64, elapsed_ns: u128, found: bool) {
+    AB_MAX_NODES.fetch_max(nodes, Ordering::Relaxed);
+    if let Some(m) = AB_STATS.get() {
+        if !found && nodes < AB_STATS_MIN_NODES.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(mut w) = m.lock() {
+            let _ = writeln!(w, "{},{},{},{},{},{}", tuple_idx, pair_idx, cd_idx, nodes, elapsed_ns, found as u8);
+            // Persist immediately for notable (>=1ms) searches so the interesting
+            // tail survives a Ctrl-C; fast pruned pairs stay buffered.
+            if elapsed_ns >= 1_000_000 {
+                let _ = w.flush();
+            }
+        }
+    }
+}
+
+fn ab_stats_flush() {
+    if let Some(m) = AB_STATS.get() {
+        if let Ok(mut w) = m.lock() {
+            let _ = w.flush();
+        }
+    }
+}
+
 fn log_write(msg: &str) {
     if let Some(m) = LOG_FILE.get() {
         if let Ok(mut f) = m.lock() {
@@ -3601,6 +3646,34 @@ fn main() {
         })
         .unwrap_or(u64::MAX);
 
+    // Parse --ab-stats <path>: log per-CD-pair AB-search finish time (see AB_STATS).
+    if let Some(path) = args.iter()
+        .position(|a| a == "--ab-stats")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+    {
+        match std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&path) {
+            Ok(f) => {
+                let mut w = BufWriter::new(f);
+                let _ = writeln!(w, "tuple,pair,cd_idx,nodes,elapsed_ns,found");
+                let _ = AB_STATS.set(Mutex::new(w));
+                println!("AB-stats mode: per-CD-pair AB finish times -> {} (stops at first valid solution)", path);
+                if let Some(minn) = args.iter()
+                    .position(|a| a == "--ab-stats-min-nodes")
+                    .and_then(|i| args.get(i + 1))
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    AB_STATS_MIN_NODES.store(minn, Ordering::Relaxed);
+                    println!("AB-stats: only logging found=0 rows with nodes >= {} (found=1 always logged)", minn);
+                }
+            }
+            Err(e) => {
+                eprintln!("Error: could not open --ab-stats file {}: {}", path, e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     if debug_pipeline {
         run_debug_pipeline(n);
         return;
@@ -3960,13 +4033,33 @@ fn main() {
 
                     cd_tried.fetch_add(1, Ordering::Relaxed);
 
+                    let ab_t0 = Instant::now();
                     let (ab_result, nodes) = backtrack_search_ab(n, c, d, st, at, backtrack_limit, &ab_constraints, &ab_max_contrib, &ab_mod6_sols);
+                    let ab_ns = ab_t0.elapsed().as_nanos();
                     if nodes >= backtrack_limit && backtrack_limit != u64::MAX {
                         ab_timeouts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if ab_stats_enabled() {
+                        // Record this fixed CD pair's AB finish time, then stop the
+                        // whole search at the first valid solution (like normal mode).
+                        ab_stats_record(tuple_idx, pair_idx, this_cd_idx, nodes, ab_ns, ab_result.is_some());
+                        if let Some((a, b)) = ab_result {
+                            let base = BaseSequence::new(a, b, Sequence::new(c.to_vec()), Sequence::new(d.to_vec()));
+                            if base.is_valid() {
+                                log_println!("WINNING CD (solution found): AB backtracking finished in {} nodes, {:.3} ms",
+                                    nodes, ab_ns as f64 / 1e6);
+                                found.store(true, Ordering::Relaxed);
+                                local_result = Some((base, tuple_idx, st.clone(), at.clone()));
+                                return false;
+                            }
+                        }
+                        return true;
                     }
                     if let Some((a, b)) = ab_result {
                         let base = BaseSequence::new(a, b, Sequence::new(c.to_vec()), Sequence::new(d.to_vec()));
                         if base.is_valid() {
+                            log_println!("WINNING CD (solution found): AB backtracking finished in {} nodes, {:.3} ms",
+                                nodes, ab_ns as f64 / 1e6);
                             found.store(true, Ordering::Relaxed);
                             local_result = Some((base, tuple_idx, st.clone(), at.clone()));
                             return false;
@@ -3996,6 +4089,13 @@ fn main() {
     #[cfg(feature = "gpu")]
     if let Some(ref filter) = gpu_spectral {
         filter.lock().unwrap().cleanup();
+    }
+
+    ab_stats_flush();
+    if ab_stats_enabled() {
+        let mx = AB_MAX_NODES.load(Ordering::Relaxed);
+        println!("AB-stats: longest AB search observed = {} nodes (~{:.3} s single-thread @140ns/node)",
+            mx, mx as f64 * 140e-9);
     }
 
     let elapsed_secs = start.elapsed().as_secs_f64() + prior_elapsed;

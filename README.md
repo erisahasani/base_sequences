@@ -5,5 +5,4 @@ Search for Base Sequences BS(n+1, n) implementing the algorithm from Wang & Zhu 
 ```bash
 RUSTFLAGS="-C target-cpu=native" cargo build --release --bin find_bs_v6_parallel
 ./target/release/find_bs_v6_parallel 30
-./target/release/find_bs_v6_parallel 30 --resume  # resume from checkpoint
 ```

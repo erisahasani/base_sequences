@@ -1289,6 +1289,12 @@ struct ShardCtx<'a> {
     claim_dir: Option<&'a str>,
     shard_depth: usize,
     partition: Option<(u64, u64)>,
+    // Prefix-level resume (feature #1): `ckpt_done` = owned depth-`shard_depth`
+    // prefixes ALREADY fully searched for THIS pair (skip them on resume);
+    // `ckpt_pending` = shared buffer where a newly-exhausted (pair_idx, prefix) is
+    // recorded for the flusher. Both None => no partition-resume checkpoint.
+    ckpt_done: Option<&'a HashSet<u64>>,
+    ckpt_pending: Option<&'a Mutex<Vec<(usize, u64)>>>,
 }
 
 impl<'a> ShardCtx<'a> {
@@ -1300,6 +1306,8 @@ impl<'a> ShardCtx<'a> {
             claim_dir: None,
             shard_depth: 0,
             partition: None,
+            ckpt_done: None,
+            ckpt_pending: None,
         }
     }
 }
@@ -1418,37 +1426,47 @@ fn is_cd_branch_done(dir: &str, tuple_idx: usize, m3m6_pair_idx: usize, depth: u
 /// Per-rank resume-log path. Keyed on (n, tuple, nparts) so a different problem
 /// or partition count uses a different file (a pair index only means the same
 /// pair for a fixed n+tuple; ownership only matches for a fixed nparts).
+// `_pfx` marks the prefix-level format ("<pair> <prefix>" per line); distinct from
+// the old pair-level filename so a stale pair-log is never misparsed.
 fn checkpoint_log_path(dir: &str, n: usize, tuple: usize, nparts: u64, rank: u64) -> String {
-    format!("{}/ckpt_n{}_t{}_N{}_r{}.log", dir, n, tuple, nparts, rank)
+    format!("{}/ckpt_n{}_t{}_N{}_r{}_pfx.log", dir, n, tuple, nparts, rank)
 }
 
-/// Load completed m3xm6-pair indices from a rank's resume log. Skips the `#`
-/// header and any torn final line (a hard kill mid-append just drops one index,
-/// which is re-searched — safe). Missing file => empty set (fresh start).
-fn load_completed_pairs(path: &str) -> HashSet<usize> {
-    let mut done = HashSet::new();
+/// Load completed (m3xm6-pair, CD-prefix) units from a rank's resume log, grouped by
+/// pair. Each data line is "<pair_idx> <prefix>". Skips the `#` header and any torn
+/// final line (a hard kill mid-append just drops one unit, which is re-searched —
+/// safe). Missing file => empty (fresh start).
+fn load_completed_prefixes(path: &str) -> HashMap<usize, HashSet<u64>> {
+    let mut done: HashMap<usize, HashSet<u64>> = HashMap::new();
     if let Ok(contents) = std::fs::read_to_string(path) {
         for line in contents.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') { continue; }
-            if let Ok(idx) = line.parse::<usize>() { done.insert(idx); }
+            let mut it = line.split_whitespace();
+            if let (Some(p), Some(x)) = (it.next(), it.next()) {
+                if let (Ok(p), Ok(x)) = (p.parse::<usize>(), x.parse::<u64>()) {
+                    done.entry(p).or_default().insert(x);
+                }
+            }
         }
     }
     done
 }
 
-/// Append the pending batch of newly-completed pair indices to the rank's log.
-/// Best-effort: a failed append just re-searches those pairs on a later resume.
-fn flush_completed_pairs(path: &str, pending: &Mutex<Vec<usize>>) {
+/// Append the pending batch of newly-completed (pair, prefix) units to the rank's log.
+/// Best-effort: a failed append just re-searches those units on a later resume.
+fn flush_completed_prefixes(path: &str, pending: &Mutex<Vec<(usize, u64)>>) {
     use std::io::Write;
-    let batch: Vec<usize> = match pending.lock() {
+    let batch: Vec<(usize, u64)> = match pending.lock() {
         Ok(mut g) if !g.is_empty() => std::mem::take(&mut *g),
         _ => return,
     };
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let mut buf = String::with_capacity(batch.len() * 7);
-        for idx in batch {
-            buf.push_str(&idx.to_string());
+        let mut buf = String::with_capacity(batch.len() * 16);
+        for (p, x) in batch {
+            buf.push_str(&p.to_string());
+            buf.push(' ');
+            buf.push_str(&x.to_string());
             buf.push('\n');
         }
         let _ = f.write_all(buf.as_bytes());
@@ -1732,6 +1750,9 @@ fn backtrack_cd_from_mod6(
 
             // Depth claimed at (0 = none), for the matching .done marker.
             let mut claimed_at_depth: usize = 0;
+            // Feature #1: true iff this is an owned partition prefix we should record
+            // as done once its subtree is fully searched.
+            let mut ckpt_boundary = false;
 
             // Modulo partition: at shard_depth, own prefix iff hash maps to our rank.
             if let Some((rank, nparts)) = shard.partition {
@@ -1739,6 +1760,12 @@ fn backtrack_cd_from_mod6(
                     if partition_owner(shard.tuple_idx, shard.m3m6_pair_idx, new_prefix, nparts) != rank {
                         continue;
                     }
+                    // Owned prefix. Prefix-level resume: skip if a prior run already
+                    // exhausted this whole subtree.
+                    if let Some(done) = shard.ckpt_done {
+                        if done.contains(&new_prefix) { continue; }
+                    }
+                    if shard.ckpt_pending.is_some() { ckpt_boundary = true; }
                 }
             }
 
@@ -2069,10 +2096,16 @@ fn backtrack_cd_from_mod6(
             d_running[rc] -= dj;
             filled[lc] -= 1;
             filled[rc] -= 1;
-            // Subtree exhausted; mark claim done for safe resume
+            // Subtree exhausted (not reached if *stop -- see early return above), so this
+            // owned prefix is fully searched: mark it done for safe resume.
             if claimed_at_depth > 0 {
                 if let Some(dir) = shard.claim_dir {
                     mark_cd_branch_done(dir, shard.tuple_idx, shard.m3m6_pair_idx, claimed_at_depth, new_prefix);
+                }
+            }
+            if ckpt_boundary {
+                if let Some(pending) = shard.ckpt_pending {
+                    if let Ok(mut g) = pending.lock() { g.push((shard.m3m6_pair_idx, new_prefix)); }
                 }
             }
         }
@@ -3902,25 +3935,29 @@ fn main() {
     let range_end = effective_range.map(|(_, e)| e).unwrap_or(sorted_arc.len());
 
     // Resume checkpoint setup (partition + single tuple + unlimited AB only).
+    // Feature #1: prefix-level -- `already_done[pair]` = set of that pair's owned CD
+    // prefixes fully searched in a prior run. Much finer than the old pair-level log,
+    // so progress survives even when no whole pair completes within a wall window.
     let (checkpoint_enabled, ckpt_path, already_done, ckpt_pending): (
-        bool, String, Arc<HashSet<usize>>, Arc<Mutex<Vec<usize>>>,
+        bool, String, Arc<HashMap<usize, HashSet<u64>>>, Arc<Mutex<Vec<(usize, u64)>>>,
     ) = match (checkpoint_dir.as_ref(), partition_spec) {
         (Some(dir), Some((rank, nparts)))
             if backtrack_limit == u64::MAX && range_end == range_start + 1 =>
         {
             let path = checkpoint_log_path(dir, n, range_start, nparts, rank);
-            let done = load_completed_pairs(&path);
+            let done = load_completed_prefixes(&path);
             if !done.is_empty() {
+                let units: usize = done.values().map(|s| s.len()).sum();
                 log_println!(
-                    "Resume: {} m3xm6-pair(s) already completed for partition {}/{} (skipping them) — {}",
-                    done.len(), rank, nparts, path
+                    "Resume: {} CD-prefix(es) across {} pair(s) already done for partition {}/{} (skipping them) — {}",
+                    units, done.len(), rank, nparts, path
                 );
             }
             // Create with a human header only if absent (never truncate a resume log).
             if !std::path::Path::new(&path).exists() {
                 if let Ok(mut f) = File::create(&path) {
                     let _ = writeln!(
-                        f, "# resume log: n={} tuple={} partition={}/{} — completed m3xm6-pair indices follow",
+                        f, "# resume log (prefix-level): n={} tuple={} partition={}/{} — '<pair> <prefix>' per line",
                         n, range_start, rank, nparts
                     );
                 }
@@ -3931,12 +3968,12 @@ fn main() {
             log_println!(
                 "WARNING: --checkpoint-dir ignored — resume requires --partition, a single --tuple, and --ab-limit unlimited"
             );
-            (false, String::new(), Arc::new(HashSet::new()), Arc::new(Mutex::new(Vec::new())))
+            (false, String::new(), Arc::new(HashMap::new()), Arc::new(Mutex::new(Vec::new())))
         }
-        _ => (false, String::new(), Arc::new(HashSet::new()), Arc::new(Mutex::new(Vec::new()))),
+        _ => (false, String::new(), Arc::new(HashMap::new()), Arc::new(Mutex::new(Vec::new()))),
     };
 
-    // Periodic flusher: append newly-completed pairs to the resume log every 120s.
+    // Periodic flusher: append newly-completed (pair, prefix) units every 120s.
     if checkpoint_enabled {
         let path = ckpt_path.clone();
         let pending_f = Arc::clone(&ckpt_pending);
@@ -3944,7 +3981,7 @@ fn main() {
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(120));
-                flush_completed_pairs(&path, &pending_f);
+                flush_completed_prefixes(&path, &pending_f);
                 if search_done_f.load(Ordering::Relaxed) { break; }
             }
         });
@@ -3982,19 +4019,21 @@ fn main() {
             let claim_dir_ref = claim_dir.as_deref();
             let result = m3_m6_pairs.into_par_iter().enumerate().find_map_any(|(pair_idx, (_mod3_sol, mod6_sol))| {
                 if found.load(Ordering::Relaxed) { return None; }
-                // Resume: this pair's owned CD-subtree was fully searched in a prior job.
-                if checkpoint_enabled && already_done.contains(&pair_idx) { return None; }
                 let mut local_result: Option<(BaseSequence, usize, SumTuple, AltSumTuple)> = None;
 
                 let ab_mod6_sols = enumerate_mod6_ab_solutions(n, st, at, &mod6_sol.p, &mod6_sol.q);
 
                 // Ownership decided inside backtrack_cd_from_mod6 via ShardCtx; no per-CD check.
+                // Feature #1: this pair's already-done owned prefixes (skip) + shared pending
+                // buffer (record newly-exhausted prefixes) travel in the ShardCtx.
                 let shard = ShardCtx {
                     tuple_idx,
                     m3m6_pair_idx: pair_idx,
                     claim_dir: claim_dir_ref,
                     shard_depth,
                     partition: partition_spec,
+                    ckpt_done: if checkpoint_enabled { already_done.get(&pair_idx) } else { None },
+                    ckpt_pending: if checkpoint_enabled { Some(&*ckpt_pending) } else { None },
                 };
 
                 backtrack_cd_from_mod6(n, &mod6_sol, spectral_margin, &mut |c, d| {
@@ -4020,15 +4059,8 @@ fn main() {
                     true
                 }, &cd_total, shard);
 
-                // Record this pair as fully searched ONLY if it completed naturally:
-                // no solution here and no global abort (timeout / peer / solution).
-                // An interrupted pair is left unmarked so resume re-searches it.
-                if checkpoint_enabled
-                    && local_result.is_none()
-                    && !ABORT_SEARCH.load(Ordering::Relaxed)
-                {
-                    if let Ok(mut g) = ckpt_pending.lock() { g.push(pair_idx); }
-                }
+                // Completed owned prefixes are recorded inside recurse (feature #1),
+                // each only after its subtree fully exhausts with no abort/solution.
 
                 local_result
             });
@@ -4046,14 +4078,15 @@ fn main() {
     search_done.store(true, Ordering::Relaxed);
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    // Final resume-log flush: capture pairs that completed since the last periodic
+    // Final resume-log flush: capture prefixes that completed since the last periodic
     // flush (e.g. just before a timeout) so their work isn't repeated on resume.
     if checkpoint_enabled {
         let new_this_run = ckpt_pending.lock().map(|g| g.len()).unwrap_or(0);
-        flush_completed_pairs(&ckpt_path, &ckpt_pending);
+        flush_completed_prefixes(&ckpt_path, &ckpt_pending);
+        let prior: usize = already_done.values().map(|s| s.len()).sum();
         log_println!(
-            "Resume log updated: +{} m3xm6-pair(s) completed this run, {} total for this rank ({})",
-            new_this_run, already_done.len() + new_this_run, ckpt_path
+            "Resume log updated: +{} CD-prefix(es) completed this run, {} total for this rank ({})",
+            new_this_run, prior + new_this_run, ckpt_path
         );
     }
 
@@ -4286,6 +4319,15 @@ fn print_solution(
     }
     println!("Tuples checked: {}", tuples_done.load(Ordering::Relaxed));
     println!("CD pairs tried: {:.2e}", cd_tried.load(Ordering::Relaxed) as f64);
+    // Machine-parseable stats on the SUCCESS path too (not just timeout), so a run
+    // that finds a solution still reports something to analyze_perftest.sh. Note:
+    // cd_checked/balance is a timeout-benchmark metric and isn't tracked here.
+    println!("PERF n: {}", n);
+    println!("PERF tuple: {}", idx);
+    println!("PERF threads: {}", rayon::current_num_threads());
+    println!("PERF elapsed_s: {:.1}", elapsed_secs);
+    println!("PERF cd_searched: {}", cd_tried.load(Ordering::Relaxed));
+    println!("PERF outcome: SOLUTION_FOUND");
     println!("");
 
     println!("Solution at tuple #{}", idx);
