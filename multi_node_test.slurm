@@ -3,36 +3,38 @@
 #SBATCH -o find_bs_multi_node.%j.out
 #SBATCH -e find_bs_multi_node.%j.err
 #SBATCH -p normal
-#SBATCH -N 45                   # keep in sync with NNODES below
+#SBATCH -N 8                    # keep in sync with NNODES below
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
-#SBATCH -t 48:00:00             # wall; TIMEOUT below self-stops ~1h under this
+#SBATCH -t 02:00:00             # wall; TIMEOUT below self-stops under this
 #SBATCH -A DMS25004
 #SBATCH --mail-user=ehasani@utexas.edu
 #SBATCH --mail-type=END,FAIL
 
-# BLIND, RESUMABLE partition search of ONE tuple -- the setup we reuse at higher n.
-# For n=42 tuple 95 this is a VALIDATION run: success = reproduces the known
-# solution (results_lonestar/BS_43_42_..._tuple95). For higher n, just edit N /
-# TUPLE / NNODES (and #SBATCH -N to match).
+# BLIND, RESUMABLE partition search of ONE tuple -- the setup we reuse at any n.
+# CURRENT: n=40 tuple 0 on 8 nodes, 2h -- a VALIDATION run (known solution
+# results_lonestar/BS_41_40_V7Parallel_tuple0_25078s.txt, ~7h single-node, so
+# ~50min expected on 8 nodes). To retarget, edit N / TUPLE / NNODES / TIMEOUT
+# and the #SBATCH -N / -t lines to match.
 #
 #   --partition R/N     provably-exact CD-tree coverage, coordination-free (no gaps)
 #   --ab-limit unlimited a finite cap could SKIP the solution's CD -> never found
 #   --timeout           binary self-stops CLEANLY under the wall: emits PERF stats,
 #                       coverage cert, and flushes the resume log (a SLURM SIGKILL
 #                       at the wall gives NONE of that -- that's what bit job 3270492)
-#   --checkpoint-dir    per-rank resume log of finished m3xm6 pairs; RESUBMIT the
+#   --checkpoint-dir    per-rank resume log of finished CD-PREFIXES (prefix-level, so
+#                       progress survives even when no whole pair completes); RESUBMIT the
 #                       same script to continue instead of restarting from scratch
 #   --coverage-dir      per-rank completion markers + exhaustive-coverage certificate
 #   --found-flag        first rank to find it writes the sentinel; peers stop in ~5s
 #   --shard-depth 4     16^4=65536 chunks/pair /45 ~= 1456 per node (cv ~0.8% at /8)
 
 # ---- knobs ----
-NNODES=45
-N=42
-TUPLE=95
+NNODES=8
+N=40
+TUPLE=0
 DEPTH=4
-TIMEOUT=169200                  # 47h: MUST be < the -t wall (leaves ~1h to unwind,
+TIMEOUT=6600                    # 110 min: MUST be < the -t wall (leaves time to
                                 # write the cert, flush resume log, roll up summary)
 
 source "$HOME/.cargo/env"
@@ -67,11 +69,11 @@ BIN=target/release/find_bs_multi_node
   echo "avx512_zmm_refs: $(objdump -d $BIN | grep -cE '%zmm')"
   echo "git_rev: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
   echo "git_dirty_files: $(git status --porcelain 2>/dev/null | wc -l)"
-  echo "algo: H1 intra-node parallel owned-prefix CD seeds (+ M2 feasibility, M3 batched counter, L8 hoisted tables)"
+  echo "algo: original CD backtracking (audit H1/M2/M3/L8 measured net-negative and reverted; git_rev is source of truth)"
 } > "$LOG_DIR/build_info.txt"
 cat "$LOG_DIR/build_info.txt"
 
-# PRE-FLIGHT: refuse to burn 45 nodes on a scalar build (~2.2x slower).
+# PRE-FLIGHT: refuse to burn the nodes on a scalar build (~2.2x slower).
 AVX=$(grep -oE 'avx_fma_mul_ops: [0-9]+' "$LOG_DIR/build_info.txt" | awk '{print $2}')
 if [ "${AVX:-0}" -eq 0 ]; then
   echo "FATAL: AVX2/FMA not compiled in (avx_fma_mul_ops=0) -- scalar fallback. Aborting." >&2
@@ -135,16 +137,16 @@ fi
 if [ -f "$FOUND_FLAG" ]; then
     echo "SOLUTION FOUND:"; cat "$FOUND_FLAG"
     ls -t BS_${N}+1_* BS_*tuple${TUPLE}* 2>/dev/null | head
-    echo ">>> (n=42 t=95 validation) compare A/B/C/D vs results_lonestar/BS_43_42_V7Parallel_inst11of12_tuple95_118506s.txt"
+    echo ">>> (n=40 t=0 validation) compare A/B/C/D vs results_lonestar/BS_41_40_V7Parallel_tuple0_25078s.txt"
 else
     markers=$(ls "$COVERAGE_DIR" 2>/dev/null | grep -c '\.done$')
     echo "No solution flag this run."
     echo "coverage markers (ranks fully exhausted, CUMULATIVE across resubmissions): $markers/$NNODES"
     if [ "${markers:-0}" -ge "$NNODES" ]; then
       echo "ALL ranks exhausted => tuple $TUPLE FULLY searched, NO solution."
-      echo "  (n=42 t=95: this CONTRADICTS the known result -> investigate a coverage bug.)"
+      echo "  (n=40 t=0 has a known solution: exhausting with NO find CONTRADICTS it -> coverage bug.)"
     else
       echo "Hit the self-timeout before exhausting. RESUBMIT THE SAME SCRIPT to continue;"
-      echo "  the resume log ($CHECKPOINT_DIR) makes it skip finished m3xm6 pairs."
+      echo "  the resume log ($CHECKPOINT_DIR) makes it skip finished CD-prefixes."
     fi
 fi

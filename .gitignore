@@ -35,3 +35,8 @@ SCALING_TO_BS_31_30.md
 arXiv*
 test_delta_correctness.rs
 test_delta.sh
+*.sh
+ab_runs
+*.png
+rust_code/find_bs_v6_parallel.rs
+rust_code/find_bs_v7_all_tuples.rs
