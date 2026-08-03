@@ -3,10 +3,10 @@
 #SBATCH -o find_bs_multi_node.%j.out
 #SBATCH -e find_bs_multi_node.%j.err
 #SBATCH -p normal
-#SBATCH -N 8                    # keep in sync with NNODES below
+#SBATCH -N 1                    # single node
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
-#SBATCH -t 02:00:00             # wall; TIMEOUT below self-stops under this
+#SBATCH -t 48:00:00             # wall; TIMEOUT below self-stops ~1h under this
 #SBATCH -A DMS25004
 #SBATCH --mail-user=ehasani@utexas.edu
 #SBATCH --mail-type=END,FAIL
@@ -30,12 +30,21 @@
 #   --shard-depth 4     16^4=65536 chunks/pair /45 ~= 1456 per node (cv ~0.8% at /8)
 
 # ---- knobs ----
-NNODES=8
-N=40
-TUPLE=0
-DEPTH=4
-TIMEOUT=6600                    # 110 min: MUST be < the -t wall (leaves time to
+NNODES=1
+N=${N:-42}                        # override per job: sbatch --export=ALL,N=42,TUPLE=95 ...
+TUPLE=${TUPLE:-0}
+DEPTH=6
+TIMEOUT=169200                  # 47h: MUST be < the 48h -t wall (leaves ~1h to
                                 # write the cert, flush resume log, roll up summary)
+
+# ---- auto-chain: keep re-queueing 47h windows until the tuple is settled ----
+# One 48h wall is not enough for a hard tuple, so each job queues its OWN successor
+# (see the CHAIN block below) with --dependency=afterany, then resumes from
+# CHECKPOINT_DIR. Only ONE job per tuple is ever in flight (stays under the queue's
+# MaxSubmitJobs), and the successor accrues 47h of AGE priority while this one runs,
+# so it starts almost immediately instead of waiting behind a cold submission.
+WINDOW=${WINDOW:-1}             # which window this job is (1-based; set by the chain)
+MAX_WINDOWS=${MAX_WINDOWS:-8}   # hard stop: 8 x 47h ~= 15.6 days per tuple
 
 source "$HOME/.cargo/env"
 cd base_sequences
@@ -55,6 +64,17 @@ mkdir -p "$COVERAGE_DIR" "$CHECKPOINT_DIR" "$LOG_DIR"
 echo "LOG_DIR=$LOG_DIR"
 echo "CHECKPOINT_DIR=$CHECKPOINT_DIR  (reused across resubmissions => resume)"
 echo "COVERAGE_DIR=$COVERAGE_DIR  FOUND_FLAG=$FOUND_FLAG"
+echo "WINDOW=$WINDOW/$MAX_WINDOWS"
+
+# A chained successor is queued with --dependency=afterany, so it also runs when the
+# predecessor SUCCEEDS. Bail out immediately (costing seconds, not 48h of a node) if
+# this tuple is already settled.
+if [ -f "$FOUND_FLAG" ]; then
+    echo "ALREADY SOLVED (found flag exists) -- nothing to do. Chain ends here."; cat "$FOUND_FLAG"; exit 0
+fi
+if [ "$(ls "$COVERAGE_DIR" 2>/dev/null | grep -c '\.done$')" -ge "$NNODES" ]; then
+    echo "ALREADY EXHAUSTED (all $NNODES rank(s) certified) -- no solution exists for tuple $TUPLE. Chain ends here."; exit 0
+fi
 
 # Build WITH AVX2 on a compute node so target-cpu=native matches the run nodes.
 RUSTFLAGS="-C target-cpu=native" cargo build --release --bin find_bs_multi_node || exit 1
@@ -88,8 +108,38 @@ fi
   echo "shard_depth: $DEPTH"
   echo "timeout_s: $TIMEOUT"
   echo "checkpoint_dir: $CHECKPOINT_DIR"
+  echo "window: $WINDOW/$MAX_WINDOWS"
   echo "start: $(date -Is)"
 } > "$LOG_DIR/run_config.txt"
+
+# ---- CHAIN: queue the NEXT window NOW, held until this job ends ----
+# Submitted here (post-build, pre-search) on purpose:
+#   * after the build+AVX preflight => a broken build never spawns a chain
+#   * before the 47h search         => the successor sits in the queue accruing AGE
+#                                      priority the whole time, so it starts right
+#                                      after this one instead of from a cold start
+# afterany (not afterok) so the chain survives a timeout/failure; the successor's
+# early-exit guard above handles the "already solved/exhausted" cases.
+SCRIPT=${SCRIPT:-$SLURM_SUBMIT_DIR/multi_node_test.slurm}
+[ -f "$SCRIPT" ] || SCRIPT=$SLURM_SUBMIT_DIR/base_sequences/multi_node_test.slurm
+[ -f "$SCRIPT" ] || SCRIPT=$HOME/base_sequences/multi_node_test.slurm
+if [ "$WINDOW" -ge "$MAX_WINDOWS" ]; then
+  echo "CHAIN: window $WINDOW is the last (MAX_WINDOWS=$MAX_WINDOWS); not queueing a successor."
+elif [ ! -f "$SCRIPT" ]; then
+  echo "CHAIN: DISABLED -- cannot locate multi_node_test.slurm (tried \$SLURM_SUBMIT_DIR and \$HOME)." >&2
+  echo "CHAIN: resubmit by hand after this window, or re-launch with SCRIPT=/abs/path in --export." >&2
+else
+  NEXT=$((WINDOW + 1))
+  CHAIN_EXPORT="ALL,N=$N,TUPLE=$TUPLE,WINDOW=$NEXT,MAX_WINDOWS=$MAX_WINDOWS,SCRIPT=$SCRIPT"
+  if OUT=$(sbatch --dependency=afterany:$SLURM_JOB_ID --export="$CHAIN_EXPORT" "$SCRIPT" 2>&1); then
+    echo "CHAIN: queued window $NEXT/$MAX_WINDOWS (held until job $SLURM_JOB_ID ends) -> $OUT"
+    echo "chain_next: $OUT" >> "$LOG_DIR/run_config.txt"
+  else
+    echo "CHAIN: sbatch from the compute node FAILED -- $OUT" >&2
+    echo "CHAIN: resume by hand from login1 once this window ends:" >&2
+    echo "  sbatch --export=ALL,N=$N,TUPLE=$TUPLE,WINDOW=$NEXT,MAX_WINDOWS=$MAX_WINDOWS $SCRIPT" >&2
+  fi
+fi
 
 # Per-node machine info + the REAL core count each task sees. nproc=1 == the
 # single-thread bug that made job 3267766 crawl; -c on srun is the fix.
@@ -134,19 +184,29 @@ else
 fi
 
 # ---- verdict ----
+# The successor (window $((WINDOW+1))) is ALREADY queued and starts when this job ends.
+# It re-runs the early-exit guard at the top, so a find/exhaustion here stops the chain
+# on its own -- nothing below needs to cancel anything.
 if [ -f "$FOUND_FLAG" ]; then
-    echo "SOLUTION FOUND:"; cat "$FOUND_FLAG"
+    echo "SOLUTION FOUND (window $WINDOW):"; cat "$FOUND_FLAG"
     ls -t BS_${N}+1_* BS_*tuple${TUPLE}* 2>/dev/null | head
-    echo ">>> (n=40 t=0 validation) compare A/B/C/D vs results_lonestar/BS_41_40_V7Parallel_tuple0_25078s.txt"
+    echo "CHAIN: the queued successor will start, see the found flag, and exit in seconds."
 else
     markers=$(ls "$COVERAGE_DIR" 2>/dev/null | grep -c '\.done$')
-    echo "No solution flag this run."
-    echo "coverage markers (ranks fully exhausted, CUMULATIVE across resubmissions): $markers/$NNODES"
+    echo "No solution flag this run (window $WINDOW/$MAX_WINDOWS)."
+    echo "coverage markers (ranks fully exhausted, CUMULATIVE across windows): $markers/$NNODES"
+    banked=$(cat "$CHECKPOINT_DIR"/*_pfx.log 2>/dev/null | grep -vc '^#')
+    echo "resume log: $banked CD-prefix(es) banked so far ($CHECKPOINT_DIR)"
     if [ "${markers:-0}" -ge "$NNODES" ]; then
-      echo "ALL ranks exhausted => tuple $TUPLE FULLY searched, NO solution."
-      echo "  (n=40 t=0 has a known solution: exhausting with NO find CONTRADICTS it -> coverage bug.)"
+      echo "ALL ranks exhausted => tuple $TUPLE FULLY searched at n=$N, NO solution exists."
+      echo "CHAIN: the queued successor will start, see the coverage cert, and exit in seconds."
+    elif [ "$WINDOW" -ge "$MAX_WINDOWS" ]; then
+      echo "Hit the self-timeout, and this was the LAST window (MAX_WINDOWS=$MAX_WINDOWS)."
+      echo "  To keep going, re-launch (it resumes from the banked prefixes above):"
+      echo "  sbatch --export=ALL,N=$N,TUPLE=$TUPLE,MAX_WINDOWS=$MAX_WINDOWS $SCRIPT"
     else
-      echo "Hit the self-timeout before exhausting. RESUBMIT THE SAME SCRIPT to continue;"
-      echo "  the resume log ($CHECKPOINT_DIR) makes it skip finished CD-prefixes."
+      echo "Hit the self-timeout before exhausting -- EXPECTED for a hard tuple."
+      echo "CHAIN: window $((WINDOW+1))/$MAX_WINDOWS is already queued and resumes from the"
+      echo "  banked prefixes above. Nothing to do by hand."
     fi
 fi
